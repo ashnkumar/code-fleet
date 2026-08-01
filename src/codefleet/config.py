@@ -43,10 +43,9 @@ class Settings(BaseSettings):
     poll_interval: float = 1.0
     tick_interval: float = 0.5
 
-    # Retries
+    # Retries. The backoff curve itself is not a knob — it lives in the
+    # scheduler, which is pure and must stay independent of Settings.
     max_attempts: int = 3
-    backoff_step_s: float = 2.0
-    backoff_max_s: float = 30.0
 
     # Escape hatches
     allow_reset: bool = False
@@ -58,11 +57,14 @@ class Settings(BaseSettings):
 
     @property
     def lease_grace_s(self) -> float:
-        """Extra time the server waits past a task's deadline before requeueing."""
-        return 60.0
+        """How long past a task's own deadline the server waits before taking it back.
 
-    def backoff_for(self, attempts: int) -> float:
-        return min(self.backoff_step_s * max(attempts, 1), self.backoff_max_s)
+        The runner enforces `task_timeout` on its own session. This is the
+        server's backstop for the case that clock fails — a runner still
+        heartbeating but no longer making progress. Heartbeat staleness cannot
+        catch that one, because the heartbeat is fine.
+        """
+        return 60.0
 
 
 @lru_cache

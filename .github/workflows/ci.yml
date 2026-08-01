@@ -1,0 +1,57 @@
+name: ci
+
+# Pull requests, plus the default branch. A push to a branch that already has a
+# pull request open would otherwise build the same commit twice.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: uv sync
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format
+        run: uv run ruff format --check .
+
+      # `-m 'not live'` is in pyproject, so the tier that needs an API key is
+      # deselected here. Everything that runs below this line is hermetic: no
+      # network beyond loopback, no key, no model call, no spend.
+      - name: Test
+        run: uv run pytest -q
+
+      # The fleet's target codebase has to be green before a run, or "the tests
+      # still pass afterwards" means nothing.
+      - name: Target repository's own suite
+        working-directory: examples/demo-repo
+        run: uv run --project "$GITHUB_WORKSPACE" python -m pytest -q
+
+      # The quickstart, executed. Scripted agents stand in for Claude sessions,
+      # so this exercises the whole path — server, scheduler, runners, the veto,
+      # the retry, the target repo's tests — and fails if the one command the
+      # README leads with has stopped working.
+      - name: Demo smoke test
+        run: uv run codefleet demo --dry-run
+        timeout-minutes: 5
