@@ -1,0 +1,84 @@
+# The task graph `codefleet demo` runs against examples/demo-repo.
+#
+# It is shaped to exercise the two behaviours that are hard to see in a
+# screenshot and easy to fake in a README:
+#
+#   dependency cascade  T1 -> T2 and T3 -> T5. T2 and T5 are unblocked by the
+#                       server the moment their dependency completes, and
+#                       picked up on the next tick without anyone asking.
+#
+#   write veto          T3 and T4 declare disjoint file scopes, so the
+#                       scheduler runs them at the same time. But T4 cannot
+#                       finish without registering its middleware in api.py,
+#                       which T3 is holding. The second writer is denied at the
+#                       tool call, backs off, and is retried once T3 releases
+#                       the file. That is the realistic failure mode: declared
+#                       scope is a guess, and agents follow the code.
+
+tasks:
+  - id: T1
+    title: "Replace config constants with a Settings dataclass"
+    description: |
+      In linkstash/config.py, replace the module-level constants with a frozen
+      dataclass named Settings holding the same four fields (base_url,
+      max_url_length, code_offset, rate_limit_per_minute), plus a module-level
+      `settings` instance built from the current default values.
+
+      Keep the old uppercase names as module-level aliases pointing at the
+      corresponding attributes of `settings`, so existing imports keep working.
+      Do not modify any other file.
+    priority: 5
+    file_scope: ["linkstash/config.py"]
+    depends_on: []
+
+  - id: T2
+    title: "Load settings from environment variables"
+    description: |
+      In linkstash/config.py, add a `load_settings()` function that builds a
+      Settings instance from environment variables, falling back to the current
+      defaults when a variable is unset. Use the prefix LINKSTASH_ and the
+      uppercased field name, e.g. LINKSTASH_BASE_URL, LINKSTASH_MAX_URL_LENGTH.
+      Integer fields must be parsed as integers.
+
+      Rebind the module-level `settings` to `load_settings()`. Do not modify any
+      other file.
+    priority: 4
+    file_scope: ["linkstash/config.py"]
+    depends_on: ["T1"]
+
+  - id: T3
+    title: "Add a health route to the dispatcher"
+    description: |
+      In linkstash/api.py, add a `GET /health` route to the `handle` dispatcher.
+      It should return `(200, {"status": "ok", "links": <number of stored links>})`.
+      Implement it as a small `health()` function alongside the existing
+      handlers. Do not modify any other file.
+    priority: 5
+    file_scope: ["linkstash/api.py"]
+    depends_on: []
+
+  - id: T4
+    title: "Add request logging middleware and enable it"
+    description: |
+      Create linkstash/middleware.py containing a `log_requests(handler)`
+      decorator. It should wrap a dispatcher function, append a
+      "<METHOD> <path> -> <status>" line to a module-level `REQUEST_LOG` list
+      for every call, and return the wrapped result unchanged.
+
+      Then wire it up: in linkstash/api.py, decorate the `handle` dispatcher
+      with `@log_requests` so the middleware is actually active. The task is not
+      finished until the decorator is applied in api.py.
+    priority: 5
+    file_scope: ["linkstash/middleware.py"]
+    depends_on: []
+
+  - id: T5
+    title: "Test the health route"
+    description: |
+      Create tests/test_api.py with pytest tests for the `GET /health` route in
+      linkstash/api.py: assert it returns status 200, that the payload contains
+      a "status" key equal to "ok", and that an unknown path still returns 404.
+      Do not modify any file outside tests/.
+    priority: 3
+    file_scope: ["tests/test_api.py"]
+    depends_on: ["T3"]

@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local state
+.env
+*.db
+*.db-wal
+*.db-shm
+codefleet.db*
+runs/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
