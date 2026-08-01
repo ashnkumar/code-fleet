@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -69,6 +70,10 @@ REQUEST_TIMEOUT_S = 10.0
 
 # The ledger is fire-and-forget, so it gets a much shorter leash than a decision.
 LEDGER_TIMEOUT_S = 2.0
+
+# How many positional slots a runner will walk past before giving up. Generous:
+# the only way to exhaust it is to have that many live runners already.
+MAX_SLOT_PROBES = 64
 
 # How long a loop waits after each consecutive transport failure, and — by its
 # length — how many it rides out before giving up. Bounded on purpose: the
@@ -108,6 +113,15 @@ class Executor(Protocol):
         on_pre_write: PreWriteCallback,
         on_post_write: PostWriteCallback,
     ) -> SessionOutcome: ...
+
+
+def _next_slot(name: str, offset: int) -> str:
+    """`runner-2` + 3 -> `runner-5`; a name with no trailing number gets a suffix."""
+    match = re.fullmatch(r"(.*?)(\d+)", name)
+    if match is None:
+        return f"{name}-{offset + 1}"
+    stem, number = match.groups()
+    return f"{stem}{int(number) + offset}"
 
 
 class Runner:
@@ -350,14 +364,34 @@ class Runner:
     # -- registration ------------------------------------------------------
 
     async def _register(self) -> None:
-        response = await self._client.post(
-            "/agents/register",
-            json={"name": self.name, "workdir": str(self.workdir), "pid": os.getpid()},
+        """Claim a slot, walking past any name a live runner already holds.
+
+        Slot names are positional (`runner-1`, `runner-2`), so a second fleet
+        started against the same server asks for names the first fleet is still
+        using. The server refuses those with `name_in_use` rather than reclaiming
+        them — reclaiming would fence a working runner and drop its leases — so
+        adding capacity mid-run means taking the next free number instead.
+        """
+        name = self.name
+        for offset in range(MAX_SLOT_PROBES):
+            response = await self._client.post(
+                "/agents/register",
+                json={"name": name, "workdir": str(self.workdir), "pid": os.getpid()},
+            )
+            if response.status_code == 409:
+                error = response.json().get("error", {})
+                if error.get("code") == "name_in_use":
+                    name = _next_slot(self.name, offset + 1)
+                    continue
+            response.raise_for_status()
+            body = response.json()
+            self.name = name
+            self.agent_id = body["agent_id"]
+            self.epoch = int(body["epoch"])
+            return
+        raise RuntimeError(
+            f"no free runner slot after {MAX_SLOT_PROBES} attempts starting at {self.name}"
         )
-        response.raise_for_status()
-        body = response.json()
-        self.agent_id = body["agent_id"]
-        self.epoch = int(body["epoch"])
 
     async def _reregister(self, stale_epoch: int) -> None:
         async with self._registering:

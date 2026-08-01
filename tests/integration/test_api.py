@@ -28,7 +28,7 @@ from httpx import ASGITransport, AsyncClient
 
 from codefleet.config import Settings
 from codefleet.engine import _maybe_finish_run, apply_decisions
-from codefleet.models import utcnow
+from codefleet.models import AgentStatus, utcnow
 from codefleet.scheduler import EmitFleetIdle
 from codefleet.server import create_app
 
@@ -816,3 +816,32 @@ async def test_health_works_on_an_empty_database(client: AsyncClient) -> None:
     state = (await client.get("/state")).json()
     assert state["tasks"] == [] and state["agents"] == [] and state["leases"] == []
     assert state["counters"]["tasks"]["pending"] == 0
+
+
+async def test_a_second_fleet_cannot_take_a_live_runners_slot(client: AsyncClient) -> None:
+    """Positional slot names collide across fleets; the second one must not win.
+
+    Registration reclaims a name so a fenced runner can recover its own row. That
+    same reclaim, applied to a *different* live process, would fence a working
+    runner and drop its leases mid-write — which is how a second `codefleet run`
+    would silently dismantle the first.
+    """
+    held = await register(client, "runner-1")  # pid 4242
+
+    intruder = await client.post(
+        "/agents/register",
+        json={"name": "runner-1", "workdir": "/tmp/demo-repo", "pid": 9999},
+    )
+    assert intruder.status_code == 409
+    assert intruder.json()["error"]["code"] == "name_in_use"
+
+    # The incumbent is untouched: same row, same epoch, still assignable.
+    agents = (await client.get("/agents")).json()["agents"]
+    incumbent = next(agent for agent in agents if agent["id"] == held.agent_id)
+    assert incumbent["epoch"] == held.epoch
+    assert incumbent["status"] != AgentStatus.OFFLINE
+
+    # And the same process re-registering is still the recovery path, not a collision.
+    again = await register(client, "runner-1")
+    assert again.agent_id == held.agent_id
+    assert again.epoch == held.epoch + 1

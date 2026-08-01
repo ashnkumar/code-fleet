@@ -222,6 +222,14 @@ async def register(body: RegisterRequest, server: ServerDep) -> dict[str, Any]:
     settings = server.settings
     async with store.transaction():
         previous = next((a for a in await store.list_agents() if a.name == body.name), None)
+        if previous is not None and _held_by_another_process(previous, body, settings, utcnow()):
+            raise ApiError(
+                409,
+                "name_in_use",
+                f"{body.name} is held by a live runner (pid {previous.pid})",
+                name=body.name,
+                holder_pid=previous.pid,
+            )
         agent = await store.register_agent(body.name, workdir=body.workdir, pid=body.pid)
         if previous is not None:
             await reclaim(store, agent.id, reason=REQUEUE_REREGISTERED)
@@ -883,6 +891,31 @@ def _agent_view(agent: Agent, now: datetime, stale_after: float) -> dict[str, An
     return _jsonable(agent) | {
         "stale": (now - agent.last_heartbeat_at).total_seconds() > stale_after
     }
+
+
+def _held_by_another_process(
+    previous: Agent, body: RegisterRequest, settings: Settings, now: datetime
+) -> bool:
+    """Would granting this name take the slot away from a runner that is still using it?
+
+    Re-registering a name is the normal recovery path: a runner that gets
+    `409 stale_epoch` re-registers, and reclaiming its own row is what lets
+    lifetime counters survive (spec D5). So the question is not "is this name
+    taken" but "is a *different, living* process answering for it".
+
+    A different pid that is still heartbeating means a second fleet was started
+    with the same positional slot names. Reclaiming there would fence a working
+    runner and release its leases mid-write, so it is refused and the caller
+    takes the next slot. A dead or offline predecessor is claimable by anyone —
+    that is a restart, not a collision. When either pid is unknown the benefit of
+    the doubt goes to the caller, since refusing would break recovery, which is
+    the more common case by far.
+    """
+    if previous.status is AgentStatus.OFFLINE:
+        return False
+    if previous.pid is None or body.pid is None or previous.pid == body.pid:
+        return False
+    return (now - previous.last_heartbeat_at).total_seconds() <= settings.stale_after
 
 
 def _assignment_view(task: Task, settings: Settings) -> dict[str, Any]:

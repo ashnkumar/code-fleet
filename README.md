@@ -187,9 +187,23 @@ Real ones, not modesty.
 - **One shared working tree. No git automation** — no worktrees, no branch per task, no commits, no
   PRs. The fleet edits files; you decide what to do with the diff. Worktrees would turn a write-time
   collision into a merge-time collision, which is a harder problem and a different project.
-- **A veto costs work.** An agent can edit correctly for a while and then be denied on a later file.
-  What it already wrote stays in the tree while its task goes back to the queue. The veto lands at the
-  *first* write to the contended file, and attempts are capped, so it is bounded — but it is not free.
+- **A failed attempt leaves its edits behind.** An agent can edit correctly for a while and then be
+  denied on a later file, or time out. What it already wrote stays in the tree, and once its task is
+  requeued those files are unlocked — so a half-applied change is visible to every other agent and to
+  the retry. The veto lands at the *first* write to the contended file and attempts are capped, so it
+  is bounded, but "the fleet finished" does not mean "only completed work is in the tree". Undoing
+  this properly means running each attempt somewhere disposable, which is the isolation trade below.
+- **Revocation cannot recall a write already in flight.** Cancelling a task, or reaping a runner that
+  stopped heartbeating, bumps that runner's epoch — but the runner only learns it was fenced on its
+  next call to the server. If its `PreToolUse` hook had already returned *allow*, that write is
+  authorized and can still land after the lease was released and handed to someone else. The window
+  is small and confined to the recovery paths, but the "one writer per file" guarantee is not
+  absolute across them. Closing it needs a write path the server can invalidate mid-flight — per
+  attempt isolation, or a broker that revalidates the lease at write time — not a faster fence.
+- **The lease is exclusivity, not authorization.** It answers "is anyone else holding this file",
+  never "is this task allowed to touch this file". Any uncontended path in the tree is granted, so a
+  confused agent can rewrite something unrelated and the veto will not object — it was never asked to.
+  `file_scope` steers the scheduler and the prompt; it does not bound the blast radius.
 - **Leases are per path, not per region.** Two agents editing unrelated functions in one large file
   serialize. Finer granularity means understanding the edit, which is a different system.
 - **Single machine.** One server, SQLite, runners as local processes. No leader election, no remote
@@ -197,8 +211,12 @@ Real ones, not modesty.
 - **No authentication.** Binds to `127.0.0.1` and assumes one trusted operator. Do not expose it.
 - **No task planning.** Tasks come from the API or a YAML file. Nothing decomposes a request into a
   graph for you.
-- **Agents are told to stay in scope, not forced to.** `file_scope` shapes scheduling and appears in
-  the prompt. The lease is the enforcement; everything before it is advice.
+- **A green run is not a verified run.** A task becomes `succeeded` when its session ends cleanly and
+  reports success, which means the model stopped — not that what it wrote compiles. The coordination
+  layer has no way to tell those apart from the inside, so pass `codefleet run --verify "pytest -q"`
+  and let the exit code decide; `codefleet demo` does this with the target repository's own suite.
+  Verification is fleet-level by necessity: agents share one tree, so running a suite mid-flight
+  would fail on somebody else's half-written file and blame the wrong task.
 - **Agents cannot run commands.** The session is given exactly
   `Read`/`Write`/`Edit`/`MultiEdit`/`NotebookEdit`/`Glob`/`Grep`; `Bash` is deliberately not among
   them. Bash is a write path the veto cannot see: `sed -i`, a formatter, `cat > file` — none of it

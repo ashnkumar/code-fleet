@@ -19,6 +19,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -198,8 +199,23 @@ def run(
     poll_interval: Annotated[float | None, typer.Option(help="Assignment poll, s.")] = None,
     heartbeat_interval: Annotated[float | None, typer.Option(help="Heartbeat, s.")] = None,
     dry_run: Annotated[bool, typer.Option(help="Scripted executors; no API calls.")] = False,
+    verify: Annotated[
+        str | None,
+        typer.Option(
+            help=(
+                "Command to run in the working tree once the fleet drains, e.g. "
+                "'pytest -q'. Its exit code decides this command's exit code."
+            )
+        ),
+    ] = None,
 ) -> None:
-    """Start runners against a server that is already up, and wait for the run to finish."""
+    """Start runners against a server that is already up, and wait for the run to finish.
+
+    `--verify` is worth using on anything real. A task reaching `succeeded` means
+    its session ended cleanly, not that the code it wrote works; the fleet has no
+    way to tell those apart from the inside. Handing it the command you would
+    have run yourself is what makes a green run mean something.
+    """
     settings = _resolve_settings(
         runners=runners,
         host=host,
@@ -223,6 +239,15 @@ def run(
     )
     with _reaching(settings):
         code = asyncio.run(_run_fleet(settings, executor_factory=factory))
+    # Only when the fleet itself drained cleanly: running checks over a tree whose
+    # tasks failed would report the fleet's failure as a test failure.
+    if (
+        verify
+        and code == 0
+        and not _verify(settings.workdir, shlex.split(verify), f"verifying: {verify}")
+    ):
+        console.print("\n[bold red]verify failed[/] the fleet finished but the tree does not pass")
+        code = 1
     raise typer.Exit(code)
 
 
@@ -560,7 +585,9 @@ async def _demo(settings: Settings, graph: Path, *, dry_run: bool, timeout: floa
     _print_summary(tasks, elapsed)
     _print_vetoes(denials)
 
-    tests_passed = _run_target_tests(settings.workdir)
+    tests_passed = _verify(
+        settings.workdir, DEMO_VERIFY, "running the target repo's own test suite"
+    )
     all_succeeded = all(task["status"] == TaskStatus.SUCCEEDED for task in tasks)
     verdict = "green" if all_succeeded and tests_passed else "red"
     console.print(
@@ -586,15 +613,27 @@ def _free_port(host: str) -> int:
         return int(sock.getsockname()[1])
 
 
-def _run_target_tests(workspace: Path) -> bool:
-    """Run the target repository's own suite. This is the demo's real assertion.
+DEMO_VERIFY: tuple[str, ...] = (sys.executable, "-m", "pytest", "-q", "--color=no")
 
-    Agents that leave a fleet's coordination intact but the codebase broken have
-    not done the job, and nothing else in this run would notice.
+
+def _verify(workspace: Path, command: Sequence[str], label: str) -> bool:
+    """Run the target's own checks over the tree the fleet left behind.
+
+    This is the only assertion in the system a fleet cannot satisfy by agreeing
+    with itself. A task is marked `succeeded` when its session ended cleanly and
+    reported success — which says the model stopped, not that what it wrote
+    compiles or works. Nothing inside the coordination layer can tell those
+    apart, so something outside it has to.
+
+    Deliberately fleet-level rather than per-task: agents share one working tree,
+    so running a suite while other agents are still editing it would fail on
+    their half-finished work and blame the wrong task. That is a real limit of
+    the shared-tree model, not an oversight — per-task verification needs
+    per-task isolation.
     """
-    console.print(f"\n[bold]running the target repo's own test suite[/] [dim]{workspace}[/]")
-    completed = subprocess.run(  # fixed argv, no shell
-        [sys.executable, "-m", "pytest", "-q", "--color=no"],
+    console.print(f"\n[bold]{label}[/] [dim]{workspace}[/]")
+    completed = subprocess.run(  # caller-supplied argv, never a shell string
+        list(command),
         cwd=workspace,
         capture_output=True,
         text=True,
