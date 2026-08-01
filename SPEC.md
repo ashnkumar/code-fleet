@@ -64,8 +64,8 @@ want to know what the fleet did, you read one table.
    codefleet tasks         │   HTTP API ────────────▶ store: SQLite (WAL)         │
    codefleet watch         │       │                    tasks  task_deps  agents  │
         ▲                  │       │                    file_leases  file_changes │
-        │ SSE              │       │                    conflicts                 │
-        └──────────────────│  scheduler tick loop       events  (append-only)     │
+        │ SSE              │       │                    events  (append-only)     │
+        └──────────────────│  scheduler tick loop                                 │
                            │       │                                              │
                            │       └─ schedule(state, now) -> [Decision]          │
                            │            pure · no I/O · unit-tested with no DB    │
@@ -122,7 +122,6 @@ it across restarts (see §3.4).
 | `attempts` | INTEGER NOT NULL | incremented on each transition into `assigned` |
 | `max_attempts` | INTEGER NOT NULL | default 3 |
 | `backoff_until` | TEXT NULL | not schedulable before this instant |
-| `lease_expires_at` | TEXT NULL | assignment lease; set on assign, cleared on terminal |
 | `result_summary` | TEXT NULL | |
 | `error` | TEXT NULL | |
 | `error_kind` | TEXT NULL | `ErrorKind` |
@@ -180,7 +179,11 @@ graph either lands whole or not at all.
 | `agent_id` | TEXT NOT NULL | |
 | `task_id` | TEXT NOT NULL | |
 | `acquired_at` | TEXT NOT NULL | |
-| `expires_at` | TEXT NOT NULL | mirrors the holding task's `lease_expires_at` |
+
+Leases have no expiry of their own. They are released when the holding task reaches a terminal state
+or is requeued, and when the holding agent is marked stale — both of which already happen in a
+transaction that has to touch the task anyway. A third expiry clock would be a third thing that can
+disagree with the other two.
 
 Exclusion is enforced by the schema, not by application logic: acquisition is
 `INSERT INTO file_leases ... ON CONFLICT(path) DO NOTHING` inside a transaction, and the decision is
@@ -199,19 +202,16 @@ Observational ledger, written from `PostToolUse`. Never read by the scheduler.
 | `tool` | TEXT NOT NULL (`Write` \| `Edit` \| `MultiEdit` \| `NotebookEdit`) |
 | `at` | TEXT NOT NULL |
 
-### 3.6 `conflicts`
+### 3.6 Conflicts are not a table
 
-One immutable row per denied write. There is no four-state resolution workflow, because nothing
-would drive it.
+A conflict is the moment a lease acquisition was denied, and that moment is already one
+`lease_denied` row in `events` carrying the path, the holder, and the requester. A second table
+would be a denormalized copy of data the events table already owns, kept in sync by hand.
 
-| Column | Type | Notes |
-| --- | --- | --- |
-| `id` | INTEGER PK AUTOINCREMENT | |
-| `path` | TEXT NOT NULL | |
-| `holder_agent_id` / `holder_task_id` | TEXT NOT NULL | who had the lease |
-| `requester_agent_id` / `requester_task_id` | TEXT NOT NULL | who was denied |
-| `at` | TEXT NOT NULL | |
-| `resolved_at` | TEXT NULL | set when the requester task later reaches `succeeded` |
+`GET /conflicts` is therefore a projection: select `lease_denied` events, join each requester task's
+current status, and report `resolved` when that task has since succeeded. One source of truth, and
+the resolution status is computed from the thing that actually determines it rather than stamped by
+whoever remembered to stamp it.
 
 ### 3.7 `events`
 
@@ -339,9 +339,8 @@ Algorithm, in order:
 6. Stop when agents run out.
 
 `Assign` applies, in one `BEGIN IMMEDIATE` transaction: `tasks.status = assigned`,
-`assigned_agent_id`, `assigned_at`, `attempts += 1`,
-`lease_expires_at = now + task_timeout + grace`, `agents.status = busy`, `current_task_id`, and
-`emit(task_assigned)`.
+`assigned_agent_id`, `assigned_at`, `attempts += 1`, `agents.status = busy`,
+`current_task_id`, and `emit(task_assigned)`.
 
 **Assignment is the claim.** There is no separate claim step and no compare-and-swap dance, because
 there is exactly one scheduler in exactly one process and the transition happens inside one
@@ -440,8 +439,8 @@ timeout (§4.7) enforced on both sides.
 3. The server attempts `INSERT ... ON CONFLICT(path) DO NOTHING` for each path in one transaction.
    All-or-nothing: if any path is held by another agent, no lease is taken and the whole request is
    denied. (Partial acquisition would create exactly the hold-and-wait condition we are avoiding.)
-4. On denial the server writes a `conflicts` row, emits `lease_denied`, and returns the holder's
-   agent name and task id.
+4. On denial the server emits `lease_denied` carrying the path, the holder and the requester, and
+   returns the holder's agent name and task id.
 5. The hook returns
 
    ```json
@@ -467,11 +466,11 @@ and therefore no deadlock. The cost is wasted work, not a stall — and the atte
 
 ### 4.6 Conflict recording
 
-One `conflicts` row per denied acquisition. Immutable. `resolved_at` is stamped when the requesting
-task later reaches `succeeded`. There is no resolution workflow, no escalation state, and no human
-approval queue — those would be four statuses with nothing driving them, which is what the reference
-shipped. `GET /conflicts` is a read of the table; the terminal dashboard renders it as a line per
-conflict.
+A denial is one `lease_denied` event and nothing else (§3.6). `GET /conflicts` projects those events
+against the requester task's current status, so a conflict reads as `resolved` exactly when the task
+that was denied has since succeeded. There is no resolution workflow, no escalation state and no
+approval queue — the reference shipped four such statuses with nothing driving any transition
+between them.
 
 ### 4.7 Retries, attempt caps, and timeouts
 
@@ -531,11 +530,12 @@ its in-flight task. Emits `agent_registered` (first time) or `agent_online`.
 
 ```json
 → {}
-← 200 {"status": "idle", "epoch": 3, "cancel_current_task": false}
+← 200 {"status": "idle", "epoch": 3}
 ```
 
-`cancel_current_task: true` tells a runner the server has taken its task away (operator cancel, or a
-requeue that already happened). The runner interrupts its session.
+There is no separate "your task was taken away" flag. Anything that removes a task from an agent —
+operator cancel, stale requeue — bumps that agent's `epoch`, so the very next call the runner makes
+returns `409 stale_epoch` and it aborts and re-registers. One mechanism covers both cases.
 
 #### `DELETE /agents/{agent_id}`
 
@@ -575,16 +575,6 @@ Pure read. Assignment already happened server-side.
 
 Always `200` — a denial is a normal outcome, not an HTTP error. All-or-nothing across `paths`.
 
-#### `POST /leases/release`
-
-```json
-→ {"agent_id": "a_9f...", "task_id": "T4", "paths": ["linkstash/api.py"]}
-← 200 {"released": ["linkstash/api.py"]}
-```
-
-Optional. Release normally happens implicitly on task terminal. Exists for a runner that knows it is
-finished with a file early.
-
 #### `POST /changes`
 
 ```json
@@ -616,15 +606,14 @@ no-op `200`.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/tasks` | Create one task. Body: `title`, `description`, `priority?`, `file_scope?`, `depends_on?`, `max_attempts?`, `id?`. `201`. |
-| `POST` | `/tasks/bulk` | Load a whole graph atomically with caller-supplied ids. Validates acyclicity and that every `depends_on` resolves. `201 {"created": ["T1", ...]}`. |
+| `POST` | `/tasks` | Create a graph. Body: `{"tasks": [{title, description, priority?, file_scope?, depends_on?, max_attempts?, id?}, ...]}`. One task and fifty take the same path. Atomic: validates acyclicity and that every `depends_on` resolves, then inserts the batch or nothing. `201 {"created": ["T1", ...]}`. |
 | `GET` | `/tasks` | `?status=&limit=&offset=`. Returns the task rows plus a derived `runnable` boolean and `unmet_dependencies` list. |
-| `GET` | `/tasks/{id}` | One task, its dependencies, its dependents, its file changes, its conflicts. |
+| `GET` | `/tasks/{id}` | One task, its dependencies, its dependents, and its file changes. |
 | `POST` | `/tasks/{id}/cancel` | Any non-terminal → `cancelled`. Releases leases, tells the holding runner via the heartbeat response. |
 | `POST` | `/tasks/{id}/retry` | `failed` → `pending`, `attempts=0`; recursively un-blocks `blocked_upstream` dependents. |
 | `GET` | `/agents` | All agents with derived `stale` boolean. |
 | `GET` | `/leases` | Current leases with holder and age. |
-| `GET` | `/conflicts` | `?resolved=` filter. |
+| `GET` | `/conflicts` | Projection over `lease_denied` events (§3.6). `?resolved=` filter. |
 | `GET` | `/events` | `?since=<id>&limit=&type=`. Paged replay. |
 | `GET` | `/events/stream` | SSE (§5.3). |
 | `GET` | `/state` | One snapshot: tasks + agents + leases + counters + `last_event_id`. What the dashboard fetches on connect before subscribing. |
@@ -639,9 +628,9 @@ none of its commands had an offline test.
 
 `GET /events/stream?since=<event_id>`
 
-Replays every event after `since`, then streams live. Reconnection uses the standard
-`Last-Event-ID` request header, so a dropped dashboard resumes exactly where it stopped — the
-integer `events.id` primary key is doing real work here.
+Replays every event after `since`, then streams live. A dropped client reconnects by passing the
+last id it saw back as `since`, so the integer `events.id` primary key is doing real work: it is the
+cursor, and replay and live tail are the same code path.
 
 ```
 id: 1043
@@ -804,11 +793,15 @@ coordination is externalized and legible.
 
 ### 6.4 Smaller decisions worth recording
 
-- **`ClaudeSDKClient`, not `query()`.** `query()` is simpler, but it offers no `interrupt()`, so a
-  wall-clock timeout has to be `asyncio.wait_for` around the generator — and the SDK documents
-  in-source that a raw asyncio cancellation can skip its terminate/kill escalation, leaving an
-  orphaned ~325 MB CLI subprocess behind. With three runners and a few timeouts that is a real
-  problem on a laptop. `ClaudeSDKClient` gives a cooperative `interrupt()` → `disconnect()` path.
+- **`query()`, not `ClaudeSDKClient`.** `ClaudeSDKClient` offers a cooperative `interrupt()`, which
+  is the tidier way to enforce a wall clock. It also requires streaming-input mode and a connect /
+  disconnect lifecycle to get right. `query()` is one call, it is what the feasibility probes proved
+  out, and the session is already bounded on three axes the SDK enforces itself (`max_turns`,
+  `max_budget_usd`, and the model's own stopping). The wall clock is an `asyncio.wait_for` backstop
+  around the generator. Honest cost: on that backstop path a cancellation can skip the SDK's
+  terminate/kill escalation and orphan a CLI subprocess, so the runner reaps its child explicitly on
+  timeout. This is the simpler thing that works; if the reaping proves unreliable, the upgrade path
+  to `ClaudeSDKClient` is local to one module.
 - **Token accounting from `ResultMessage.model_usage`.** `ResultMessage.usage` is an untyped
   passthrough of the *final* API call's usage plus an `iterations` array — measured at 136/82 tokens
   in a session whose true totals were 657/94. `model_usage` is the typed, cumulative,
@@ -958,7 +951,7 @@ demo target exist.
 | D14 | Do heartbeats emit events? | No. Only state transitions do. | Heartbeats are liveness, not history. Emitting them would flood the table the dashboard, the SSE stream, and the recording all read from. |
 | D15 | Does a failed task strand its dependents? | No. They are explicitly marked `blocked_upstream` with the failing ancestor named. | The reference fired its cascade only on success, so dependents of a failed task sat `pending` forever and the fleet looked healthy while work was stranded. |
 | D16 | What happens when the coordination server is unreachable from a hook? | Deny. Fail closed. Task fails `infra`, retryable. | Failing open reintroduces the exact collision the system exists to prevent. |
-| D17 | Is there a planner that decomposes a request into tasks? | Not in v1. Tasks come from `POST /tasks`, `POST /tasks/bulk`, or a YAML file. | It is a separable concern and it is where the reference spent its complexity budget. The interesting claim here is the coordination, and a planner would sit cleanly on top of the same API later. |
+| D17 | Is there a planner that decomposes a request into tasks? | Not in v1. Tasks come from `POST /tasks` or a YAML file. | It is a separable concern and it is where the reference spent its complexity budget. The interesting claim here is the coordination, and a planner would sit cleanly on top of the same API later. |
 | D18 | Is the CLI an HTTP client or does it touch the database? | HTTP client, exclusively. | The reference's CLI wrote directly to the store, which is exactly why `reset` and the workflows disagreed about state. One writer, one set of invariants. |
 
 ---
@@ -992,6 +985,12 @@ demonstrate the thing this is about, and several would obscure it.
   There is no fleet-wide budget, no spend alerting, and no rate-limit backoff policy beyond
   respecting the SDK's `RateLimitEvent`.
 - **Windows support.** POSIX paths, POSIX signals, tested on macOS and Linux.
+- **A container image.** There is no external service to stand up: the store is an in-process SQLite
+  file and the only network dependency is the Anthropic API. `claude-agent-sdk` ships the Claude Code
+  CLI as a bundled ~245 MB binary and prefers it over anything on `PATH`, so `uv sync` alone produces
+  a working runner with no Node, no npm, and no separate CLI install. A Dockerfile would add a large
+  image, a mounted working tree and a forwarded API key in exchange for nothing. The quickstart is
+  `uv sync && uv run codefleet demo`.
 
 ---
 
