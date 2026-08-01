@@ -24,7 +24,7 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Coroutine, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from functools import partial
@@ -38,7 +38,7 @@ from rich.console import Console
 from rich.table import Table
 
 from codefleet.config import Settings, get_settings
-from codefleet.dashboard import stream_events, watch
+from codefleet.dashboard import STATUS_STYLE, stream_events, watch
 from codefleet.models import EventType, Task, TaskStatus
 from codefleet.runner import Executor, Runner, ScriptedExecutor, ScriptedWrite
 
@@ -258,7 +258,7 @@ async def _run_fleet(
     fleet = _spawn_runners(settings, executor_factory)
     started = time.monotonic()
     try:
-        await _await_run_finished(settings.base_url, since, timeout)
+        await _await_run_finished(settings.base_url, since, timeout, fleet)
     finally:
         await _stop_runners(fleet)
 
@@ -289,23 +289,71 @@ def _spawn_runners(
 
 
 async def _stop_runners(fleet: Sequence[tuple[Runner, asyncio.Task[None]]]) -> None:
-    """Shut runners down before the server: deregistration needs somewhere to go."""
+    """Shut runners down before the server: deregistration needs somewhere to go.
+
+    A runner that died on its own is reported here rather than discarded. This is
+    the last place its exception exists — after this the task is gone — and a
+    fleet that quietly shrank is the difference between a run that is slow and a
+    run that is never going to finish.
+    """
     for runner, _ in fleet:
         await runner.shutdown()
+    outcomes = await asyncio.gather(*(task for _, task in fleet), return_exceptions=True)
+    for (runner, _), outcome in zip(fleet, outcomes, strict=True):
+        if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
+            console.print(f"[bold red]{runner.name} died[/] {type(outcome).__name__}: {outcome}")
+
+
+async def _wait_while_the_fleet_lives(
+    watcher: Coroutine[Any, Any, None],
+    fleet: Sequence[tuple[Runner, asyncio.Task[None]]],
+    *,
+    timeout: float | None,
+) -> None:
+    """Wait for `watcher`, unless the fleet dies out or `timeout` elapses first.
+
+    Waiting on `run_finished` is only sound while somebody is still running: the
+    server emits it when the queue drains, and a queue with no runner left never
+    drains. Racing the wait against the fleet's own liveness is what turns "every
+    runner is gone" from a silent, permanent hang into a line and an exit code.
+    """
+    waiting = [asyncio.ensure_future(watcher)]
+    if fleet:
+        waiting.append(asyncio.create_task(_outlive(fleet), name="fleet-liveness"))
+    try:
+        done, _ = await asyncio.wait(waiting, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in waiting:
+            task.cancel()
+        await asyncio.gather(*waiting, return_exceptions=True)
+
+    if not done:
+        console.print(f"[bold yellow]run did not finish within {timeout:.0f}s[/]")
+        return
+    if waiting[0] not in done:
+        console.print("[bold red]every runner has stopped[/] — nothing is left to finish this run")
+        return
+    waiting[0].result()  # whatever ended the wait, including a broken event stream
+
+
+async def _outlive(fleet: Sequence[tuple[Runner, asyncio.Task[None]]]) -> None:
+    """Return once no runner is left standing."""
     await asyncio.gather(*(task for _, task in fleet), return_exceptions=True)
 
 
-async def _await_run_finished(base_url: str, since: int, timeout: float | None) -> None:
+async def _await_run_finished(
+    base_url: str,
+    since: int,
+    timeout: float | None,
+    fleet: Sequence[tuple[Runner, asyncio.Task[None]]] = (),
+) -> None:
     async def wait() -> None:
         async with httpx.AsyncClient(base_url=base_url, timeout=None) as client:
             async for event in stream_events(client, since=since):
                 if event.get("type") == EventType.RUN_FINISHED:
                     return
 
-    try:
-        await asyncio.wait_for(wait(), timeout=timeout)
-    except TimeoutError:
-        console.print(f"[bold yellow]run did not finish within {timeout:.0f}s[/]")
+    await _wait_while_the_fleet_lives(wait(), fleet, timeout=timeout)
 
 
 DEMO_CONTESTED_PATH = "linkstash/api.py"
@@ -494,12 +542,11 @@ async def _demo(settings: Settings, graph: Path, *, dry_run: bool, timeout: floa
 
             fleet = _spawn_runners(settings, _scripted_factory(settings) if dry_run else None)
             try:
-                await asyncio.wait_for(
+                await _wait_while_the_fleet_lives(
                     watch(settings.base_url, stop_on_run_finished=True, console=console),
+                    fleet,
                     timeout=timeout,
                 )
-            except TimeoutError:
-                console.print(f"[bold yellow]run did not finish within {timeout:.0f}s[/]")
             finally:
                 await _stop_runners(fleet)
 
@@ -673,13 +720,13 @@ def _task_summary_table(tasks: Sequence[dict[str, Any]]) -> Table:
 
 
 def _status_colour(status: str) -> str:
-    return {
-        TaskStatus.SUCCEEDED: "bold green",
-        TaskStatus.FAILED: "bold red",
-        TaskStatus.BLOCKED_UPSTREAM: "magenta",
-        TaskStatus.CANCELLED: "dim",
-        TaskStatus.RUNNING: "bold yellow",
-    }.get(status, "cyan")  # type: ignore[arg-type]
+    """One mapping, shared with the live dashboard.
+
+    A summary table that colours a status differently from the screen the run was
+    just watched on reads as a disagreement about what happened. `cyan` covers a
+    status this build has not heard of.
+    """
+    return STATUS_STYLE.get(status, "cyan")
 
 
 def _print_summary(tasks: Sequence[dict[str, Any]], elapsed_s: float) -> None:
@@ -700,7 +747,14 @@ def _print_summary(tasks: Sequence[dict[str, Any]], elapsed_s: float) -> None:
 def _print_vetoes(denials: Sequence[dict[str, Any]]) -> None:
     """The veto is the headline, so it gets its own paragraph rather than a row."""
     if not denials:
-        console.print("[dim]no write was vetoed in this run[/]")
+        # The contended file is a genuine race between two live agents, so it is
+        # not guaranteed to fire — one can finish and release before the other
+        # asks. Say so, rather than leaving a reader wondering what they missed.
+        console.print(
+            "[dim]no write was vetoed in this run — the two agents that contend for"
+            " one file happened not to overlap. Try again, or use --dry-run, where"
+            " the timing is scripted and the veto always fires.[/]"
+        )
         return
     console.print()
     for event in denials:

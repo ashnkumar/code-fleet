@@ -10,8 +10,10 @@ empirically rather than by reading docs:
 * the write veto. `permission_mode="bypassPermissions"` plus a `PreToolUse` hook
   that returns `permissionDecision: "deny"`. That hook is the only thing standing
   between an agent and the filesystem, so it fails *closed*: a path it cannot
-  place inside the working tree is refused locally, and a coordination callback
-  that raises denies rather than allows.
+  place inside the working tree is refused locally, a write tool whose input
+  names no path it can read is refused too, and a coordination callback that
+  raises denies rather than allows. `SESSION_TOOLS` is the other half of it —
+  the session is given only tools whose writes the hook can see.
 * hermeticity. `setting_sources=[]` keeps the host user's `~/.claude` agents,
   skills and CLAUDE.md out of the session, and the captured `init` frame is the
   record proving it.
@@ -23,25 +25,12 @@ empirically rather than by reading docs:
 from __future__ import annotations
 
 import asyncio
-import os
 import time
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import ExitStack, aclosing, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TextIO
-
-from codefleet.config import Settings
-from codefleet.models import WRITE_TOOL_MATCHER, ErrorKind, Task
-
-# The Claude Code CLI stamps CLAUDECODE and CLAUDE_CODE_ENTRYPOINT into the
-# environment of everything it spawns. A session launched from inside a Claude
-# Code session inherits them, the child CLI reads them as "I am nested", and
-# behaves differently from the same session launched from a bare shell. Clearing
-# them here — before the SDK is imported and captures the environment — makes a
-# run identical wherever it was started from.
-os.environ.pop("CLAUDECODE", None)
-os.environ.pop("CLAUDE_CODE_ENTRYPOINT", None)
 
 import claude_agent_sdk as sdk
 from claude_agent_sdk import (
@@ -51,11 +40,37 @@ from claude_agent_sdk import (
     HookMatcher,
     ResultMessage,
     SystemMessage,
+    Transport,
 )
+
+from codefleet.config import Settings
+from codefleet.models import WRITE_TOOL_MATCHER, ErrorKind, Task
 
 # A single tool result carrying a large file overflows one NDJSON line and kills
 # the session with an unrecoverable CLIJSONDecodeError. The SDK default is 1 MiB.
 MAX_BUFFER_SIZE = 32 * 1024 * 1024
+
+# The only tools a session may call. Every write path in this list is one the
+# PreToolUse veto can actually see: Write, Edit, MultiEdit and NotebookEdit each
+# name their target in their tool input, so the hook can resolve a path and ask
+# the coordination server for a lease before the write lands.
+#
+# Bash is absent on purpose, and so is Task. A shell command writes files
+# without ever handing a path to a hook — `sed -i`, a redirect, a formatter, a
+# codegen script, `python -c` — so gating it would mean parsing arbitrary shell,
+# which is not a boundary anyone should trust; Task is excluded because a
+# subagent would get its own tool set and take Bash with it. The cost is real:
+# an agent cannot run the test suite or any other command from inside a task.
+# That is the price of the lease being the only way a file changes.
+SESSION_TOOLS: tuple[str, ...] = (
+    "Read",
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "Glob",
+    "Grep",
+)
 
 OUTSIDE_WORKDIR_REASON = "outside_workdir"
 
@@ -79,11 +94,16 @@ class PreWriteDecision:
     """What the coordination layer says about a pending write.
 
     `message` is handed to the model verbatim as the denial reason, so it should
-    read as an instruction to stop rather than an error string.
+    read as an instruction to stop rather than an error string. `path` names the
+    file the decision was actually about: one tool call can ask for several
+    paths and be refused over any one of them, and the task's `blocked_on_path`
+    has to be the file someone else holds, not whichever path happened to be
+    listed first.
     """
 
     allow: bool
     message: str | None = None
+    path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,14 +178,28 @@ follow the code where it actually leads.
 # ---------------------------------------------------------------------------
 
 
-def extract_paths(tool_input: Mapping[str, Any]) -> list[str]:
+def extract_paths(tool_input: Any) -> list[str]:
     """Pull the target paths out of a write tool's input, in the order given.
 
-    `Write` and `Edit` carry a single `file_path`. Some tools spell it `path`,
-    and a `MultiEdit`-shaped input may carry an `edits` list whose entries name
-    their own file. Duplicates are collapsed so a multi-edit of one file asks for
-    one lease.
+    `Write` and `Edit` carry a single `file_path`, `NotebookEdit` spells it
+    `notebook_path`, some tools spell it `path`, and a `MultiEdit`-shaped input
+    may carry an `edits` list whose entries name their own file. Duplicates are
+    collapsed so a multi-edit of one file asks for one lease.
+
+    Every key a gated tool can use has to be here: a write tool whose target
+    this function cannot find is refused outright rather than waved through, so
+    a miss costs a task rather than the lease.
+
+    The argument is typed `Any` rather than `Mapping` on purpose. The hook is
+    handed whatever the CLI put in `tool_input`, which is model-shaped JSON, not
+    a validated schema. A list, a string or a number there must come back as "no
+    paths" — which the caller turns into a denial — rather than as an
+    `AttributeError` thrown out of the hook, because an exception leaving the
+    hook is decided by the CLI rather than by us.
     """
+    if not isinstance(tool_input, Mapping):
+        return []
+
     found: list[str] = []
 
     def add(value: Any) -> None:
@@ -174,6 +208,7 @@ def extract_paths(tool_input: Mapping[str, Any]) -> list[str]:
 
     add(tool_input.get("file_path"))
     add(tool_input.get("path"))
+    add(tool_input.get("notebook_path"))
 
     edits = tool_input.get("edits")
     if isinstance(edits, list):
@@ -181,6 +216,7 @@ def extract_paths(tool_input: Mapping[str, Any]) -> list[str]:
             if isinstance(edit, Mapping):
                 add(edit.get("file_path"))
                 add(edit.get("path"))
+                add(edit.get("notebook_path"))
 
     return found
 
@@ -191,13 +227,21 @@ def normalize_path(raw: str, workdir: Path) -> str | None:
     Symlinks are resolved on both sides, so a link inside the tree pointing out
     of it does not smuggle a write past the lease table. The result is the
     relative POSIX form the lease table is keyed by.
-    """
-    candidate = Path(raw)
-    if not candidate.is_absolute():
-        candidate = workdir / candidate
 
-    resolved = candidate.resolve()
-    root = workdir.resolve()
+    A string the filesystem refuses to even look at — an embedded NUL, a name
+    longer than the OS allows — is `None` too, not an exception: the caller
+    turns `None` into a denial, and a raise here would leave the decision to the
+    CLI instead.
+    """
+    try:
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = workdir / candidate
+
+        resolved = candidate.resolve()
+        root = workdir.resolve()
+    except (ValueError, OSError):
+        return None
     if not resolved.is_relative_to(root):
         return None
     return resolved.relative_to(root).as_posix()
@@ -239,6 +283,7 @@ class SessionRecorder:
 
     denied_paths: list[str] = field(default_factory=list)
     out_of_bounds_paths: list[str] = field(default_factory=list)
+    unreadable_writes: list[str] = field(default_factory=list)
     files_written: list[str] = field(default_factory=list)
     hook_error: str | None = None
     init_frame: dict[str, Any] | None = None
@@ -250,6 +295,10 @@ class SessionRecorder:
 
     def record_out_of_bounds(self, path: str) -> None:
         self.out_of_bounds_paths.append(path)
+
+    def record_unreadable_write(self, tool: str) -> None:
+        """A gated write tool whose input named no path the veto could read."""
+        self.unreadable_writes.append(tool)
 
     def record_hook_error(self, exc: BaseException) -> None:
         # First failure wins; a coordination server that is down will fail every
@@ -309,6 +358,22 @@ class SessionRecorder:
                 **common,
             )
 
+        if self.unreadable_writes:
+            # Infra, not agent error: the agent asked for a legal write and the
+            # extractor could not name its target, which means this module has
+            # fallen behind a tool schema. Loud is the point — the alternative
+            # is a write the lease table never saw.
+            tool = self.unreadable_writes[0]
+            return SessionOutcome(
+                ok=False,
+                error=(
+                    f"refused a {tool} write: its input named no path the veto could read, "
+                    "so no lease could be taken out on it"
+                ),
+                error_kind=ErrorKind.INFRA,
+                **common,
+            )
+
         if self.denied_paths:
             blocked = self.denied_paths[0]
             return SessionOutcome(
@@ -356,17 +421,35 @@ def sum_model_usage(model_usage: Mapping[str, Mapping[str, Any]] | None) -> tupl
     """Sum `(input_tokens, output_tokens, cost_usd)` across every model in a session.
 
     A session that falls back, or delegates to a cheaper model, has one entry per
-    model and the totals are the sum. Older CLIs omit the field entirely, which
-    reads as zero rather than as an error — a missing accounting record should
-    not fail a task that otherwise succeeded.
+    model and the totals are the sum. Older CLIs omit the field entirely, and a
+    malformed entry counts as zero rather than raising — a missing or broken
+    accounting record must not fail a task that already ran and was already paid
+    for.
     """
     if not model_usage:
         return (0, 0, 0.0)
 
-    def total(key: str) -> float:
-        return sum(float(usage.get(key) or 0) for usage in model_usage.values())
+    def total(*keys: str) -> float:
+        return sum(
+            _numeric(usage.get(key))
+            for usage in model_usage.values()
+            if isinstance(usage, Mapping)
+            for key in keys
+        )
 
-    return (int(total("inputTokens")), int(total("outputTokens")), total("costUSD"))
+    return (int(total(*_INPUT_TOKEN_KEYS)), int(total("outputTokens")), total("costUSD"))
+
+
+# Cached prompt tokens are input tokens that were read and billed; they just
+# arrive in their own fields. Leaving them out puts `input_tokens` and
+# `cost_usd` — which prices them — on different denominators, and the two are
+# persisted side by side.
+_INPUT_TOKEN_KEYS = ("inputTokens", "cacheReadInputTokens", "cacheCreationInputTokens")
+
+
+def _numeric(value: Any) -> float:
+    """Read one usage field, treating anything that is not a number as zero."""
+    return float(value) if isinstance(value, int | float) else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +493,16 @@ def make_pre_write_hook(
             paths.append(relative)
 
         if not paths:
-            return allow_response()
+            # The matcher only fires for a write tool, so this is a write whose
+            # input shape this module does not recognize. Allowing it would put
+            # a file change past the lease table unseen, which is the one thing
+            # this hook exists to prevent.
+            recorder.record_unreadable_write(tool)
+            return deny_response(
+                f"This {tool} call names no file path that write coordination can read, "
+                "so it cannot be allowed. Stop now and report that the write could not "
+                "be coordinated."
+            )
 
         try:
             decision = await on_pre_write(paths, tool)
@@ -427,8 +519,13 @@ def make_pre_write_hook(
         if decision.allow:
             return allow_response()
 
-        recorder.record_denial(paths[0])
-        return deny_response(decision.message or _DEFAULT_DENY_REASON.format(path=paths[0]))
+        # The coordination layer names the path it refused when it knows it; a
+        # tool call asking for several paths can be denied over any one of them,
+        # and that path is what the task is blocked on.
+        named = decision.path
+        blocked = named if named is not None and named in paths else paths[0]
+        recorder.record_denial(blocked)
+        return deny_response(decision.message or _DEFAULT_DENY_REASON.format(path=blocked))
 
     return hook
 
@@ -478,12 +575,18 @@ def build_options(
     without it the same demo behaves differently on every machine. Note that
     setting `skills=` silently flips this back on — if skills are ever enabled
     here, `setting_sources` has to be passed again in the same call.
+
+    `tools=` is the base set the session gets, not a permission list: under
+    `bypassPermissions` an `allowed_tools` entry would only pre-approve, while
+    this removes everything not named from the session entirely. See
+    `SESSION_TOOLS` for why the list is what it is.
     """
     return ClaudeAgentOptions(
         model=settings.model,
         cwd=str(workdir),
         permission_mode="bypassPermissions",
         setting_sources=[],
+        tools=list(SESSION_TOOLS),
         max_turns=settings.max_turns,
         max_budget_usd=settings.task_budget_usd,
         max_buffer_size=MAX_BUFFER_SIZE,
@@ -556,20 +659,21 @@ async def run_session(
             stderr=stderr_callback,
         )
 
-        preexisting_children = _live_cli_children()
+        prompt = build_prompt(task)
+        transport = _new_transport(prompt=prompt, options=options)
         try:
             await asyncio.wait_for(
-                _drain(prompt=build_prompt(task), options=options, recorder=recorder),
+                _drain(prompt=prompt, options=options, recorder=recorder, transport=transport),
                 timeout=settings.task_timeout,
             )
         except TimeoutError:
             duration_ms = int((time.monotonic() - started) * 1000)
-            reaped = _reap_cli_children(preexisting_children)
+            reaped = _reap_transport_child(transport)
             return SessionOutcome(
                 ok=False,
                 error=(
                     f"session exceeded {settings.task_timeout:.0f}s wall clock"
-                    + (f"; killed CLI pid {reaped}" if reaped else "")
+                    + (f"; killed CLI pid {reaped}" if reaped is not None else "")
                 ),
                 error_kind=ErrorKind.TIMEOUT,
                 duration_ms=duration_ms,
@@ -585,54 +689,70 @@ def _line_writer(handle: TextIO) -> Callable[[str], None]:
     """The SDK hands stderr to the callback a line at a time, newline stripped."""
 
     def write(line: str) -> None:
+        # The SDK's stderr reader is a detached task and can outlive the session
+        # it belongs to — on the timeout path this file is closed while the CLI
+        # is still being killed. A late line has nowhere to go; raising here
+        # would surface inside the SDK's own task as a spurious failure.
+        if handle.closed:
+            return
         handle.write(line + "\n")
 
     return write
 
 
-async def _drain(*, prompt: str, options: ClaudeAgentOptions, recorder: SessionRecorder) -> None:
+async def _drain(
+    *,
+    prompt: str,
+    options: ClaudeAgentOptions,
+    recorder: SessionRecorder,
+    transport: Transport | None = None,
+) -> None:
     """Consume the whole message stream, keeping only what the recorder wants.
 
     Draining promptly matters: the SDK buffers 100 messages internally, so a slow
     consumer throttles the agent it is watching.
     """
-    async with aclosing(sdk.query(prompt=prompt, options=options)) as stream:
+    async with aclosing(sdk.query(prompt=prompt, options=options, transport=transport)) as stream:
         async for message in stream:
             recorder.observe(message)
 
 
-def _live_cli_children() -> frozenset[Any]:
-    """Snapshot the CLI subprocesses the SDK currently has open.
+def _new_transport(*, prompt: str, options: ClaudeAgentOptions) -> Transport:
+    """Build the CLI transport ourselves so this session owns a handle on its child.
 
-    This reaches into the SDK's private registry on purpose. `query()` gives the
-    caller no handle on the child it spawns, and on the `asyncio.wait_for` path
-    the transport's own terminate/kill escalation is skipped — its `close()`
-    shields against anyio cancellation but not against a raw asyncio one, as its
-    docstring says. What survives is the registry entry, which is the only thing
-    left to reap by.
+    `query()` otherwise spawns the subprocess internally and hands the caller
+    nothing to kill, which matters on the `asyncio.wait_for` path: the
+    transport's terminate/kill escalation is skipped there, because its `close()`
+    shields against anyio cancellation but not against a raw asyncio one. The
+    only thing the SDK leaves behind is an entry in a module-global registry
+    shared by every runner in this process, so reaping by "what appeared since I
+    started" attributes a sibling runner's healthy CLI to whoever timed out.
+    Passing our own transport is a documented `query()` parameter and removes
+    the guesswork: this session kills this session's child and nothing else.
     """
-    from claude_agent_sdk._internal.transport.subprocess_cli import _ACTIVE_CHILDREN
+    from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
-    return frozenset(_ACTIVE_CHILDREN)
+    return SubprocessCLITransport(prompt=prompt, options=options)
 
 
-def _reap_cli_children(preexisting: Iterable[Any]) -> list[int]:
-    """Kill CLI subprocesses this session started and the SDK did not clean up.
+def _reap_transport_child(transport: Transport) -> int | None:
+    """Kill this session's own CLI subprocess if the SDK left it running, and say which.
 
-    Anything already running when the session began belongs to someone else and
-    is left alone. SIGKILL rather than SIGTERM: this path runs only after the
-    wall clock expired on a session that is by definition not responding, and
-    asyncio's child watcher reaps the exit status without us waiting on it.
+    SIGKILL rather than SIGTERM: this runs only after the wall clock expired on a
+    session that is by definition not responding, and asyncio's child watcher
+    reaps the exit status without us waiting on it.
     """
     from claude_agent_sdk._internal.transport import subprocess_cli
 
-    known = set(preexisting)
-    reaped: list[int] = []
-    for child in list(subprocess_cli._ACTIVE_CHILDREN):
-        if child in known or child.returncode is not None:
-            continue
-        with suppress(ProcessLookupError):
-            child.kill()
-        reaped.append(child.pid)
-        subprocess_cli._ACTIVE_CHILDREN.discard(child)
-    return reaped
+    # A private attribute, because the transport exposes no public handle on its
+    # child. A unit test asserts it is still there, so a rename in the SDK is
+    # caught offline rather than by a leaked CLI process on the next timeout.
+    child = getattr(transport, "_process", None)
+    if child is None or child.returncode is not None:
+        return None
+    with suppress(ProcessLookupError):
+        child.kill()
+    # Drop it from the SDK's atexit sweep; this one is already dealt with.
+    subprocess_cli._ACTIVE_CHILDREN.discard(child)
+    pid: int = child.pid
+    return pid

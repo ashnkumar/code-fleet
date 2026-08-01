@@ -47,12 +47,20 @@ tasks:
     depends_on: ["T1"]
 
   - id: T3
-    title: "Add a health route to the dispatcher"
+    title: "Add health and stats routes to the dispatcher"
     description: |
-      In linkstash/api.py, add a `GET /health` route to the `handle` dispatcher.
-      It should return `(200, {"status": "ok", "links": <number of stored links>})`.
-      Implement it as a small `health()` function alongside the existing
-      handlers. Do not modify any other file.
+      In linkstash/api.py, add two routes to the `handle` dispatcher, each as a
+      small function alongside the existing handlers.
+
+      `GET /health` returns `(200, {"status": "ok", "links": <number of stored
+      links>})`.
+
+      `GET /stats` returns `(200, {"links": <number of stored links>})`.
+
+      Give every handler function in the file — the two new ones and the three
+      that already exist — a one-line docstring saying what it returns.
+
+      Do not modify any other file.
     priority: 5
     file_scope: ["linkstash/api.py"]
     depends_on: []
@@ -60,14 +68,19 @@ tasks:
   - id: T4
     title: "Add request logging middleware and enable it"
     description: |
-      Create linkstash/middleware.py containing a `log_requests(handler)`
-      decorator. It should wrap a dispatcher function, append a
-      "<METHOD> <path> -> <status>" line to a module-level `REQUEST_LOG` list
-      for every call, and return the wrapped result unchanged.
+      Wire request logging into the dispatcher, then implement it.
 
-      Then wire it up: in linkstash/api.py, decorate the `handle` dispatcher
-      with `@log_requests` so the middleware is actually active. The task is not
-      finished until the decorator is applied in api.py.
+      Step one, in linkstash/api.py: add `from linkstash.middleware import
+      log_requests` and decorate the `handle` dispatcher with `@log_requests`.
+      Do this first, before writing the middleware itself, so the call site is
+      settled before the implementation is.
+
+      Step two: create linkstash/middleware.py containing that
+      `log_requests(handler)` decorator. It wraps a dispatcher function, appends
+      a "<METHOD> <path> -> <status>" line to a module-level `REQUEST_LOG` list
+      on every call, and returns the wrapped result unchanged.
+
+      The task is not finished until both are done.
     priority: 5
     file_scope: ["linkstash/middleware.py"]
     depends_on: []

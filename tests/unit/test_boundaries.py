@@ -33,6 +33,14 @@ SESSION = "codefleet.session"
 RUNNER = "codefleet.runner"
 SCHEDULER = "codefleet.scheduler"
 STORE = "codefleet.store"
+ENGINE = "codefleet.engine"
+SERVER = "codefleet.server"
+
+# The web framework, and everything that only exists to speak HTTP. `engine.py`
+# was split out of `server.py` precisely so the state machine could be read and
+# tested as rows and events rather than as requests; an import from this list is
+# that split quietly undoing itself.
+WEB = ("fastapi", "starlette", "uvicorn", "httpx")
 
 # Anything that reaches a database, a socket, an event loop or a web framework.
 # The scheduler takes a snapshot and returns decisions; if it needs any of these
@@ -53,18 +61,24 @@ def modules(repo_root: Path) -> dict[str, Path]:
     return found
 
 
-def imports_of(path: Path) -> set[str]:
-    """Every module name imported anywhere in a file, however it is spelled.
+def imports_of(path: Path, *, eager: bool = False) -> set[str]:
+    """Every module name imported in a file, however it is spelled.
 
     `ast.walk` rather than a scan of the top level, so an import buried in a
     function or behind `TYPE_CHECKING` counts the same as one at the top. A
     `from x import y` records both `x` and `x.y`, because that is how a submodule
     import looks and there is no way to tell it from a name import without
     resolving the package.
+
+    `eager=True` narrows it to the imports that actually run when the module is
+    first imported: the top level only, so neither a `TYPE_CHECKING` guard nor an
+    import inside a function body counts. Neither executes, which is exactly the
+    distinction the runner depends on.
     """
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    nodes: list[ast.AST] = list(tree.body) if eager else list(ast.walk(tree))
     found: set[str] = set()
-    for node in ast.walk(tree):
+    for node in nodes:
         if isinstance(node, ast.Import):
             found.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
@@ -73,9 +87,11 @@ def imports_of(path: Path) -> set[str]:
     return found
 
 
-def imports(path: Path, module: str) -> bool:
+def imports(path: Path, module: str, *, eager: bool = False) -> bool:
     """True if the file imports `module` or anything inside it."""
-    return any(name == module or name.startswith(f"{module}.") for name in imports_of(path))
+    return any(
+        name == module or name.startswith(f"{module}.") for name in imports_of(path, eager=eager)
+    )
 
 
 def test_only_the_session_module_talks_to_the_sdk(modules: dict[str, Path]) -> None:
@@ -112,6 +128,38 @@ def test_the_runner_holds_no_coordination_logic(modules: dict[str, Path], forbid
         f"{forbidden} means it now evaluates dependencies, compares file scopes or writes "
         "coordination state itself — three copies of the policy that have to agree, and a "
         "fleet whose behaviour depends on which runner build is deployed."
+    )
+
+
+@pytest.mark.parametrize("forbidden", [SDK, SESSION])
+def test_the_runner_reaches_the_session_module_only_lazily(
+    modules: dict[str, Path], forbidden: str
+) -> None:
+    """A narrower claim than the one above: the runner may use `codefleet.session`,
+    but not at import time."""
+    assert not imports(modules[RUNNER], forbidden, eager=True), (
+        f"{RUNNER} imports {forbidden} at module scope. It is allowed to reach {SESSION} "
+        "inside a function body — that is how the default executor is built — but importing "
+        "it eagerly makes the SDK a hard dependency of constructing a `Runner`, and with it "
+        "of every coordination test, the scripted demo and CI. The import belongs where it "
+        "is used, or behind `TYPE_CHECKING`."
+    )
+
+
+@pytest.mark.parametrize("forbidden", WEB)
+def test_the_engine_speaks_no_http(modules: dict[str, Path], forbidden: str) -> None:
+    """The seam the server/engine split exists to create, asserted rather than described.
+
+    `engine.py` opens with the claim that nothing in it imports a web framework.
+    That claim is what makes the tick loop and every transition it makes testable
+    against a `Store` and a `Settings` with no app, no client and no ASGI
+    lifespan — and it is one `Depends(...)` away from being false.
+    """
+    assert not imports(modules[ENGINE], forbidden), (
+        f"{ENGINE} imports {forbidden}. The state machine moved out of {SERVER} so that the "
+        "transitions could be read and exercised as rows and events; reaching for the web "
+        "framework here folds the two back together and makes every transition test need an "
+        "app to drive it. Whatever needs a request or a response belongs in the router."
     )
 
 

@@ -27,6 +27,9 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from codefleet.config import Settings
+from codefleet.engine import _maybe_finish_run, apply_decisions
+from codefleet.models import utcnow
+from codefleet.scheduler import EmitFleetIdle
 from codefleet.server import create_app
 
 BASE_URL = "http://codefleet.test"
@@ -144,6 +147,18 @@ async def eventually[T](check: Callable[[], Awaitable[T | None]], *, timeout: fl
             return result
         if monotonic() > deadline:
             raise AssertionError(f"condition did not hold within {timeout}s")
+        await asyncio.sleep(0.01)
+
+
+async def consistently(check: Callable[[], Awaitable[Any]], *, for_s: float = 0.3) -> None:
+    """The mirror of `eventually`: a state the fleet must not leave.
+
+    `for_s` is many tick intervals wide, so a failure here means the fleet decided
+    to move something, not that the assertion merely ran before the loop did.
+    """
+    deadline = monotonic() + for_s
+    while monotonic() < deadline:
+        await check()
         await asyncio.sleep(0.01)
 
 
@@ -538,6 +553,118 @@ async def test_cancelling_a_task_fences_the_agent_holding_it(client: AsyncClient
     assert stale.json()["error"]["code"] == "stale_epoch"
 
 
+async def test_a_cancelled_agent_is_not_handed_the_next_task(client: AsyncClient) -> None:
+    """Revocation fences before it frees (spec 4.4).
+
+    The agent holding a cancelled task is a runner that does not know yet: it is
+    still inside its session and will not meet the fence until its next call.
+    `idle` is precisely the state the scheduler assigns to, so handing the slot
+    back here spends an innocent task's attempt on a runner that is about to 409
+    and abandon it — and `attempts` is never refunded by a requeue (spec 4.7).
+    """
+    runner = await register(client, "runner-1")
+    await create_tasks(client, task_spec("T1", priority=5), task_spec("T2"))
+    assert (await runner.await_assignment())["id"] == "T1"
+    await runner.start("T1")
+
+    assert (await client.post("/tasks/T1/cancel")).status_code == 200
+
+    async def t2_is_untouched() -> None:
+        task = await get_task(client, "T2")
+        assert (task["status"], task["attempts"]) == ("pending", 0), (
+            "T2 was handed to the runner whose task was just revoked"
+        )
+
+    # `cancel` sets the wake event, so the next tick is immediate: a fenced agent
+    # left assignable takes this work deterministically, not occasionally.
+    await consistently(t2_is_untouched)
+
+    agent = (await client.get("/agents")).json()["agents"][0]
+    assert (agent["status"], agent["current_task_id"]) == ("offline", None)
+    assert "agent_offline" in await event_types(client)
+
+    # Re-registration is the only event that proves the runner has stopped, and
+    # it is what returns the slot to the pool.
+    revived = await register(client, "runner-1")
+    assert (await revived.await_assignment())["id"] == "T2"
+    assert (await get_task(client, "T2"))["attempts"] == 1
+
+
+@pytest.mark.parametrize("app", [{"task_timeout": -60.0}], indirect=True)
+async def test_the_deadline_sweep_fences_the_agent_it_took_the_task_from(
+    client: AsyncClient,
+) -> None:
+    """The other revocation path owes the same ordering as `cancel`.
+
+    `lease_grace_s` is a fixed 60 s backstop on top of `task_timeout`, so a
+    negative timeout is the only way to reach the sweep inside a test. What runs
+    is the production path unchanged: bump the epoch, park the agent, requeue.
+    """
+    runner = await register(client, "runner-1")
+    await create_tasks(client, task_spec("T1", priority=5), task_spec("T2"))
+    assert (await runner.await_assignment())["id"] == "T1"
+
+    async def t2_is_untouched() -> None:
+        assert (await get_task(client, "T2"))["attempts"] == 0, (
+            "the swept agent was handed T2 before its runner knew it had been fenced"
+        )
+
+    await consistently(t2_is_untouched)
+
+    agent = (await client.get("/agents")).json()["agents"][0]
+    assert (agent["status"], agent["epoch"]) == ("offline", runner.epoch + 1)
+    assert (await get_task(client, "T1"))["status"] == "pending"
+
+
+async def test_the_fleet_events_do_not_fire_over_work_that_landed_after_the_snapshot(
+    app: FastAPI, client: AsyncClient
+) -> None:
+    """A tick decides from a snapshot and writes in a later transaction.
+
+    A `POST /tasks` can commit in that gap, and then `fleet_idle` and
+    `run_finished` are written for a fleet that has pending work — a run that
+    reads as over while the batch that just arrived is still queued. The window
+    is between two transactions of one tick and cannot be opened from outside, so
+    this plays the second half of the tick by hand with the snapshot the first
+    half took.
+    """
+    runner = await register(client, "runner-1")
+    await create_tasks(client, task_spec("T1"))
+    await runner.await_assignment()
+    await runner.complete("T1", ok=True, summary="done")
+
+    async def finished() -> list[str] | None:
+        types = await event_types(client)
+        return types if "run_finished" in types else None
+
+    await eventually(finished)
+    # Dropping the slot keeps the new task pending: `run_finished` also waits on
+    # busy agents, and this isolates the task half of the question.
+    gone = await client.delete(f"/agents/{runner.agent_id}", headers=runner.headers)
+    assert gone.status_code == 204
+
+    server = app.state.fleet
+    drained = await server.store.fleet_state(stale_after_s=server.settings.stale_after)
+    await create_tasks(client, task_spec("T2"))
+
+    server.fleet_idle_emitted = False
+    server.run_finished_emitted = False
+    await apply_decisions(server, drained, [EmitFleetIdle()], utcnow())
+    types = await event_types(client)
+    assert types.count("fleet_idle") == 1, "fleet_idle fired over a task the snapshot never saw"
+    assert types.count("run_finished") == 1
+
+    # The same window one step later: the idle edge was legitimate and already
+    # emitted, but the finish is decided afterwards and must see the new work.
+    # `_maybe_finish_run` reads the two flags before it awaits anything, so the
+    # live loop — which resets them on every pass that sees work — cannot get
+    # between setting them here and the decision they drive.
+    server.fleet_idle_emitted = True
+    server.run_finished_emitted = False
+    await _maybe_finish_run(server)
+    assert (await event_types(client)).count("run_finished") == 1
+
+
 async def test_fleet_idle_and_run_finished_are_emitted_once_per_run(
     client: AsyncClient,
 ) -> None:
@@ -567,6 +694,37 @@ async def test_fleet_idle_and_run_finished_are_emitted_once_per_run(
 
 
 # -- graphs -----------------------------------------------------------------
+
+
+async def test_listing_tasks_pages_the_queue_in_queue_order(client: AsyncClient) -> None:
+    """`GET /tasks` shows the queue, which means the store's ordering, not its own.
+
+    Highest priority first, then oldest, then by id — the order the scheduler is
+    handed. A listing that sorted for itself would be a second copy of that rule,
+    and the operator would be reading a queue the fleet does not have.
+    """
+    await create_tasks(
+        client,
+        task_spec("T1", priority=1),
+        task_spec("T2", priority=5),
+        task_spec("T3", priority=3),
+        task_spec("T4", priority=5),
+    )
+
+    listing = (await client.get("/tasks")).json()
+    assert [task["id"] for task in listing["tasks"]] == ["T2", "T4", "T3", "T1"]
+    assert listing["total"] == 4
+
+    # Paging is a slice of that one order, not a re-sort of each page.
+    page = (await client.get("/tasks", params={"limit": 2, "offset": 1})).json()
+    assert [task["id"] for task in page["tasks"]] == ["T4", "T3"]
+    assert page["total"] == 4, "total counts the queue, not the page"
+
+    runner = await register(client, "runner-1")
+    assert (await runner.await_assignment())["id"] == "T2"
+    assigned = (await client.get("/tasks", params={"status": "assigned"})).json()
+    assert [task["id"] for task in assigned["tasks"]] == ["T2"]
+    assert assigned["total"] == 1
 
 
 async def test_a_cyclic_graph_is_rejected_whole(client: AsyncClient) -> None:

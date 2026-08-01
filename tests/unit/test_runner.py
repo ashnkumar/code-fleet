@@ -8,9 +8,10 @@ executor for `ScriptedExecutor` and the whole runner-side protocol still runs.
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import json
+import logging
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ import httpx
 import pytest
 
 import codefleet.runner as runner_module
+from codefleet import cli
 from codefleet.config import Settings
 from codefleet.models import ErrorKind
 from codefleet.runner import Runner, ScriptedExecutor, ScriptedWrite
@@ -44,13 +46,22 @@ class StubServer:
     test can assert on the protocol rather than on the runner's internals.
     """
 
-    def __init__(self, *, lease: str = "allow", stale_heartbeats: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        lease: str = "allow",
+        stale_heartbeats: int = 0,
+        faults: Sequence[str] = (),
+    ) -> None:
         self.calls: list[tuple[str, str, str | None]] = []
         self.completions: list[dict[str, Any]] = []
         self.registrations = 0
         self.epoch = 0
         self.lease = lease
         self.stale_heartbeats = stale_heartbeats
+        # Path suffixes that answer 500 once each: one entry is a blip, several
+        # of the same suffix is a server that stays broken.
+        self.faults = list(faults)
         self.assignment_pending = True
         self.completed = asyncio.Event()
 
@@ -60,6 +71,13 @@ class StubServer:
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
         self.calls.append((request.method, path, request.headers.get("X-Agent-Epoch")))
+
+        if self._faulty(path):
+            if path.endswith("/start"):
+                # The server never moved the task on, so it is still on offer —
+                # which is what makes a retried poll meaningful.
+                self.assignment_pending = True
+            return httpx.Response(500, json={"error": {"code": "boom", "message": "transient"}})
 
         if path == "/agents/register":
             self.registrations += 1
@@ -111,24 +129,34 @@ class StubServer:
 
         raise AssertionError(f"unexpected {request.method} {path}")
 
+    def _faulty(self, path: str) -> bool:
+        for suffix in self.faults:
+            if path.endswith(suffix):
+                self.faults.remove(suffix)
+                return True
+        return False
+
     def _lease(self, body: dict[str, Any]) -> httpx.Response:
         if self.lease == "error":
             return httpx.Response(500, json={"error": {"code": "boom", "message": "no"}})
-        if self.lease == "deny":
+        if self.lease in {"deny", "deny-last"}:
+            # `deny-last` is the interesting shape: a request for several paths
+            # refused over one that is not the first.
+            held = body["paths"][-1] if self.lease == "deny-last" else body["paths"][0]
             return httpx.Response(
                 200,
                 json={
                     "decision": "deny",
                     "denied": [
                         {
-                            "path": body["paths"][0],
+                            "path": held,
                             "holder_agent_id": "a_other",
                             "holder_agent_name": "runner-2",
                             "holder_task_id": "T3",
                             "reason": "held",
                         }
                     ],
-                    "message": f"{body['paths'][0]} is held by runner-2 for task T3.",
+                    "message": f"{held} is held by runner-2 for task T3.",
                 },
             )
         return httpx.Response(200, json={"decision": "allow", "granted": body["paths"]})
@@ -257,6 +285,47 @@ async def test_a_denied_lease_is_reported_as_a_veto(tmp_path: Path) -> None:
     assert "POST /changes" not in stub.sequence()
 
 
+async def test_a_denial_carries_the_path_the_server_actually_refused(tmp_path: Path) -> None:
+    """A multi-path write refused over its *second* path is blocked on that path.
+
+    `session.make_pre_write_hook` records `decision.path` as the file the task is
+    blocked on and falls back to the first path asked for when the decision names
+    none. The server then widens the task's `file_scope` with it before the
+    retry — so a runner that reads the server's `denied[].path` only into the
+    prose puts a file nobody contended into the next attempt's scope, and the
+    retry can collide over it.
+    """
+    denials: list[Any] = []
+    other = "linkstash/models.py"
+
+    async def multi_path_write(
+        *, task: Any, workdir: Path, on_pre_write: Any, on_post_write: Any
+    ) -> Any:
+        # One tool call asking for two files, the way MultiEdit does.
+        decision = await on_pre_write([other, TARGET], "MultiEdit")
+        denials.append(decision)
+        # Exactly what the real PreToolUse hook does with the answer.
+        blocked = decision.path if decision.path in (other, TARGET) else other
+        return runner_module._outcome(
+            ok=False,
+            error=f"blocked: {blocked} is held by another agent",
+            error_kind=ErrorKind.VETO,
+            blocked_on_path=blocked,
+        )
+
+    stub = StubServer(lease="deny-last")
+    await drive(stub, tmp_path, executor=multi_path_write)
+
+    (decision,) = denials
+    assert decision.allow is False
+    assert decision.path == TARGET
+    assert TARGET in (decision.message or "")
+
+    (report,) = stub.completions
+    assert report["error_kind"] == ErrorKind.VETO
+    assert report["blocked_on_path"] == TARGET
+
+
 async def test_write_coordination_failure_fails_closed(tmp_path: Path) -> None:
     stub = StubServer(lease="error")
     await drive(stub, tmp_path)
@@ -294,47 +363,156 @@ async def test_scripted_executor_stops_at_the_first_denied_write(tmp_path: Path)
     assert not (tmp_path / "work" / "linkstash" / "store.py").exists()
 
 
-# ---------------------------------------------------------------------------
-# The architectural claim, enforced mechanically
-# ---------------------------------------------------------------------------
-
-
-def _imports(tree: ast.AST, *, module_level_only: bool) -> set[str]:
-    nodes = tree.body if module_level_only else list(ast.walk(tree))  # type: ignore[attr-defined]
-    names: set[str] = set()
-    for node in nodes:
-        if isinstance(node, ast.Import):
-            names.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            names.add(node.module)
-    return names
-
-
-@pytest.fixture
-def runner_source() -> ast.Module:
-    return ast.parse(Path(runner_module.__file__).read_text(encoding="utf-8"))
-
-
-def test_runner_holds_no_coordination_logic(runner_source: ast.Module) -> None:
-    """No store, no scheduler, anywhere in the module — not even lazily."""
-    everywhere = _imports(runner_source, module_level_only=False)
-    assert "codefleet.store" not in everywhere
-    assert "codefleet.scheduler" not in everywhere
-
-
-def test_runner_needs_no_sdk_to_import(runner_source: ast.Module) -> None:
-    """`codefleet.session` is the only module allowed to reach the SDK.
-
-    The runner does not import it at module scope either, so a `Runner` can be
-    constructed — and every coordination test driven — on a machine with no
-    `claude_agent_sdk` installed.
-    """
-    at_import = _imports(runner_source, module_level_only=True)
-    assert "claude_agent_sdk" not in at_import
-    assert "codefleet.session" not in at_import
-
-
 def test_runner_is_constructible_without_touching_the_network(tmp_path: Path) -> None:
     runner = Runner("runner-9", "http://nowhere:1", tmp_path, settings_for(tmp_path))
     assert runner.agent_id is None
     assert runner.epoch == 0
+
+
+# The AST tests that used to live here are gone: tests/unit/test_boundaries.py
+# makes the same claims about this module with a stricter walker, and two
+# implementations of one boundary is one of them silently rotting.
+
+
+# ---------------------------------------------------------------------------
+# Staying up
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("endpoint", ["/heartbeat", "/assignment", "/start"])
+async def test_a_transient_server_error_does_not_shrink_the_fleet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, endpoint: str
+) -> None:
+    """One 500 is weather. A runner that dies of it is a slot lost for the run.
+
+    This is the failure the heartbeat and stale-agent machinery exists to make
+    survivable, so the runner has to be around to be swept — not gone.
+    """
+    monkeypatch.setattr(runner_module, "RETRY_BACKOFF_S", (0.0,) * 5)
+    stub = StubServer(faults=[endpoint])
+
+    await drive(stub, tmp_path, timeout=2.0)
+
+    (report,) = stub.completions
+    assert report["ok"] is True
+    assert not stub.faults, f"the stub never got to fail {endpoint}"
+
+
+async def test_a_server_that_never_answers_ends_the_runner_loudly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The retry budget is bounded: a permanent fault still ends the runner.
+
+    Riding out a blip must not become a slot spinning forever against a server it
+    will never reach again, and the exception has to reach the caller so the
+    command that started the fleet can say the fleet is gone.
+    """
+    monkeypatch.setattr(runner_module, "RETRY_BACKOFF_S", (0.0, 0.0))
+    stub = StubServer(faults=["/assignment"] * 10)
+    client = stub.client()
+    runner = Runner("runner-1", "http://stub", tmp_path, settings_for(tmp_path), client=client)
+
+    with (
+        caplog.at_level(logging.WARNING, logger="codefleet.runner"),
+        pytest.raises(httpx.HTTPStatusError),
+    ):
+        await asyncio.wait_for(runner.run_forever(), 5.0)
+    await client.aclose()
+
+    assert "giving up" in caplog.text
+    assert "HTTP 500" in caplog.text
+    # Tried the budget, then stopped: three attempts, not ten and not one.
+    polls = [call for call in stub.calls if call[1].endswith("/assignment")]
+    assert len(polls) == 3
+
+
+async def test_the_init_frame_is_reported_rather_than_discarded(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The frame is the record that a session ran under the posture we asked for."""
+    frame = {
+        "session_id": "sess_abc",
+        "cwd": str((tmp_path / "work").resolve()),
+        "model": "claude-haiku-4-5-20251001",
+        "permissionMode": "bypassPermissions",
+        "tools": ["Read", "Write", "Edit"],
+    }
+
+    async def executor(**_: Any) -> Any:
+        return runner_module._outcome(ok=True, summary="done", init_frame=frame)
+
+    stub = StubServer()
+    with caplog.at_level(logging.INFO, logger="codefleet.runner"):
+        await drive(stub, tmp_path, executor=executor)
+
+    assert "claude-haiku-4-5-20251001" in caplog.text
+    assert "permission_mode=bypassPermissions" in caplog.text
+    assert "tools=3" in caplog.text
+    assert "not the shared tree" not in caplog.text
+
+
+async def test_a_session_that_ran_outside_the_shared_tree_is_flagged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Writes outside the coordinated tree are writes no lease could have vetoed."""
+
+    async def executor(**_: Any) -> Any:
+        return runner_module._outcome(
+            ok=True, summary="done", init_frame={"cwd": str(tmp_path / "elsewhere")}
+        )
+
+    stub = StubServer()
+    with caplog.at_level(logging.WARNING, logger="codefleet.runner"):
+        await drive(stub, tmp_path, executor=executor)
+
+    assert "not the shared tree" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# What `codefleet run` does with a runner that died
+#
+# These belong to cli.py rather than runner.py, but the subject is a dead
+# runner: the two defects are the same defect seen from either end.
+# ---------------------------------------------------------------------------
+
+
+def _dead_fleet(tmp_path: Path, failure: BaseException) -> list[tuple[Runner, asyncio.Task[None]]]:
+    async def die() -> None:
+        raise failure
+
+    runner = Runner("runner-1", "http://nowhere:1", tmp_path, settings_for(tmp_path))
+    return [(runner, asyncio.create_task(die(), name="runner-1-main"))]
+
+
+async def test_a_dead_runner_is_reported_not_discarded(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fleet = _dead_fleet(tmp_path, RuntimeError("the fleet lost this one"))
+
+    await cli._stop_runners(fleet)
+
+    printed = capsys.readouterr().out
+    assert "runner-1" in printed
+    assert "the fleet lost this one" in printed
+
+
+async def test_the_wait_for_a_finished_run_ends_when_the_last_runner_dies(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`run_finished` can only arrive while somebody is still running the run.
+
+    Waiting on it with no runner left is a hang with an empty screen, which is
+    indistinguishable from a fleet that is merely slow.
+    """
+
+    async def never_finishes() -> None:
+        await asyncio.Event().wait()
+
+    fleet = _dead_fleet(tmp_path, RuntimeError("boom"))
+
+    await asyncio.wait_for(
+        cli._wait_while_the_fleet_lives(never_finishes(), fleet, timeout=None), 2.0
+    )
+
+    assert "every runner has stopped" in capsys.readouterr().out
+    await cli._stop_runners(fleet)

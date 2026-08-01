@@ -1,40 +1,31 @@
-"""The coordination server: HTTP surface, tick loop, SSE stream.
+"""The coordination server: the HTTP surface, the SSE stream, the app factory.
 
 This is the only process that writes coordination state, which is what makes the
 rest of the design simple. Runners hold no policy: they register, heartbeat, read
 the assignment the server already made, and report. The scheduler holds no state:
-it is handed a snapshot and returns a list of decisions. Everything in between —
-turning those decisions into rows and events, cascading dependencies, fencing
-zombies, widening a vetoed task's scope — lives here.
+it is handed a snapshot and returns a list of decisions. What sits between those
+two — the tick loop and every transition it makes — is `codefleet.engine`; this
+module is the wire: request in, transition, response and event out.
 
-Three things are worth knowing before reading on:
+Two things are worth knowing before reading on:
 
-* **The tick loop is the heart.** It wakes on an `asyncio.Event` set by any write
-  that could create readiness, or on `tick_interval` as a reconciliation sweep.
-  Each pass snapshots the fleet, calls the pure `schedule()`, and applies the
-  returned decisions **in order, inside one transaction**. The order is the
-  scheduler's contract: leases released by step 1 are what make step 5's
-  assignments legal.
-* **`epoch` is the only revocation mechanism.** Anything that takes a task away
-  from an agent — a stale requeue, an operator cancel, a deadline sweep — bumps
-  that agent's epoch, so the agent's next call returns `409 stale_epoch` and it
-  re-registers. There is no second "your task was cancelled" flag to keep in
-  sync with the first.
 * **A denied lease is a 200.** Denial is a normal coordination outcome, not a
   transport error, and the hook on the other end has to be able to tell those two
   apart: an HTTP failure means the server is unreachable and the write must fail
   closed, a denial means another agent holds the file.
+* **`X-Agent-Epoch` on every runner call is the fence.** Anything that takes a
+  task away from an agent bumps that agent's epoch, so the next call it makes —
+  whichever one that is — returns `409 stale_epoch` and it re-registers. There is
+  no second "your task was cancelled" flag to keep in sync with the first.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from importlib.metadata import version
 from time import monotonic
 from typing import Annotated, Any
@@ -45,6 +36,20 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from codefleet.config import Settings, get_settings
+from codefleet.engine import (
+    RELEASE_TASK_TERMINAL,
+    REQUEUE_DEREGISTERED,
+    REQUEUE_REREGISTERED,
+    SCAN_LIMIT,
+    ServerState,
+    fence_agent,
+    fleet_counters,
+    free_agent,
+    reclaim,
+    requeue,
+    task_deadline,
+    tick_loop,
+)
 from codefleet.models import (
     RETRYABLE_ERROR_KINDS,
     Agent,
@@ -59,35 +64,13 @@ from codefleet.models import (
     isoformat,
     utcnow,
 )
-from codefleet.scheduler import (
-    Assign,
-    BlockDownstream,
-    Decision,
-    EmitFleetIdle,
-    FailTask,
-    MarkAgentOffline,
-    RequeueTask,
-    backoff_delay,
-    is_runnable,
-    schedule,
-)
+from codefleet.scheduler import backoff_delay, is_runnable
 from codefleet.store import GraphError, Store, TaskSpec
-
-logger = logging.getLogger("codefleet.server")
 
 VERSION = version("codefleet")
 
-# Reasons that end up in `lease_released` / `task_requeued` payloads. They are the
-# operator's explanation of why work moved, so they are named once here.
-REQUEUE_REREGISTERED = "agent_reregistered"
-REQUEUE_DEREGISTERED = "agent_deregistered"
-REQUEUE_DEADLINE = "deadline_exceeded"
-RELEASE_TASK_TERMINAL = "task_terminal"
-RELEASE_TASK_REQUEUED = "task_requeued"
-
-# Fleet-sized data: a few hundred tasks and a few thousand events. These caps
-# exist so a runaway query is bounded, not because paging is expected.
-SCAN_LIMIT = 10_000
+# Fleet-sized data: a few hundred tasks and a few thousand events. This cap
+# exists so a runaway query is bounded, not because paging is expected.
 CONFLICT_SCAN_LIMIT = 10_000
 
 SSE_POLL_S = 0.25
@@ -131,43 +114,6 @@ class TaskGraphRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Server state
-# ---------------------------------------------------------------------------
-
-
-@dataclass(slots=True)
-class ServerState:
-    """Everything the process owns that is not in SQLite.
-
-    The three in-memory fields are all edge detectors over durable state, not
-    state of their own: which one-shot fleet events have already been emitted for
-    the current batch of work, and which completion reports have already been
-    applied.
-    """
-
-    settings: Settings
-    store: Store
-    wake: asyncio.Event
-    started_at: datetime
-    fleet_idle_emitted: bool = False
-    run_finished_emitted: bool = False
-    # Idempotence for `POST /tasks/{id}/complete`, keyed (task, agent, attempt).
-    # The window this closes is a runner retrying a report it already delivered,
-    # which is seconds wide and inside one server process — so an in-memory memo
-    # is the honest size of the mechanism. What a restart forgets, the durable
-    # state still knows: a duplicate for an attempt that has since gone terminal
-    # or been requeued is refused from the row itself, not from this dict.
-    completions: dict[tuple[str, str, int], dict[str, Any]] = field(default_factory=dict)
-
-
-def _server(request: Request) -> ServerState:
-    return request.app.state.fleet
-
-
-ServerDep = Annotated[ServerState, Depends(_server)]
-
-
-# ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
 
@@ -196,6 +142,14 @@ def _not_found(noun: str, ident: str) -> ApiError:
 # ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
+
+
+def _server(request: Request) -> ServerState:
+    """The engine's state, hung off the app by `create_app`'s lifespan."""
+    return request.app.state.fleet
+
+
+ServerDep = Annotated[ServerState, Depends(_server)]
 
 
 async def _requesting_agent_id(request: Request) -> str:
@@ -270,7 +224,7 @@ async def register(body: RegisterRequest, server: ServerDep) -> dict[str, Any]:
         previous = next((a for a in await store.list_agents() if a.name == body.name), None)
         agent = await store.register_agent(body.name, workdir=body.workdir, pid=body.pid)
         if previous is not None:
-            await _reclaim(store, agent.id, reason=REQUEUE_REREGISTERED)
+            await reclaim(store, agent.id, reason=REQUEUE_REREGISTERED)
         await store.emit(
             EventType.AGENT_REGISTERED if previous is None else EventType.AGENT_ONLINE,
             agent_id=agent.id,
@@ -317,7 +271,7 @@ async def deregister(agent_id: str, server: ServerDep, agent: AgentDep) -> Respo
     store = server.store
     async with store.transaction():
         await store.update_agent(agent.id, status=AgentStatus.OFFLINE, current_task_id=None)
-        await _reclaim(store, agent.id, reason=REQUEUE_DEREGISTERED)
+        await reclaim(store, agent.id, reason=REQUEUE_DEREGISTERED)
         await store.emit(
             EventType.AGENT_OFFLINE,
             agent_id=agent.id,
@@ -451,7 +405,7 @@ async def complete_task(
             response = await _complete_succeeded(store, task, agent, result, now)
         else:
             response = await _complete_failed(store, task, agent, result, now)
-        await _free_agent(store, agent.id, task_id)
+        await free_agent(store, agent.id, task_id)
 
     server.completions[memo_key] = response
     server.wake.set()
@@ -503,7 +457,7 @@ async def _complete_failed(
             error_kind=error_kind,
             blocked_on_path=result.blocked_on_path,
         )
-        await _requeue(store, task, reason=error_kind.value, backoff_until=backoff_until)
+        await requeue(store, task, reason=error_kind.value, backoff_until=backoff_until)
         return {
             "status": TaskStatus.PENDING,
             "attempts": task.attempts,
@@ -557,16 +511,24 @@ async def list_tasks(
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     """Task rows plus the two derived fields nothing stores: `runnable` and
-    `unmet_dependencies` (spec 4.1 — blockedness is a join)."""
+    `unmet_dependencies` (spec 4.1 — blockedness is a join).
+
+    Queue order and paging come from `store.list_tasks`, which is the same
+    ordering the scheduler is handed and the same one the index is built for; the
+    snapshot is here only for the derived fields. Sorting the snapshot instead
+    would be a second copy of the queue order that has to agree with the first.
+    """
     now = utcnow()
-    state = await server.store.fleet_state(stale_after_s=server.settings.stale_after)
-    tasks = sorted(state.tasks, key=lambda task: (-task.priority, task.created_at, task.id))
-    if status is not None:
-        tasks = [task for task in tasks if task.status is status]
-    page = tasks[offset : offset + limit]
+    store = server.store
+    async with store.transaction():
+        # One transaction, so the page cannot contain a task the snapshot behind
+        # `runnable` and `unmet_dependencies` never saw.
+        state = await store.fleet_state(stale_after_s=server.settings.stale_after)
+        page = await store.list_tasks(status=status, limit=limit, offset=offset)
+    total = sum(1 for task in state.tasks if status is None or task.status is status)
     return {
         "tasks": [_task_view(task, state, now) for task in page],
-        "total": len(tasks),
+        "total": total,
     }
 
 
@@ -588,11 +550,13 @@ async def get_task(task_id: str, server: ServerDep) -> dict[str, Any]:
 
 @router.post("/tasks/{task_id}/cancel")
 async def cancel_task(task_id: str, server: ServerDep) -> dict[str, Any]:
-    """Cancel is a revocation, so it bumps the holder's epoch.
+    """Cancel is a revocation, so it fences the holder (spec 4.4).
 
     That is the whole "tell the runner its task was taken away" mechanism: the
     zombie's next call — heartbeat, lease, completion — returns `409 stale_epoch`
-    and it aborts the session and re-registers.
+    and it aborts the session and re-registers. Until it does it stays `offline`,
+    because a runner that has not yet heard it was fenced is not a runner that
+    can be given work.
     """
     store = server.store
     async with store.transaction():
@@ -605,6 +569,11 @@ async def cancel_task(task_id: str, server: ServerDep) -> dict[str, Any]:
                 status=task.status.value,
             )
         holder_id = task.assigned_agent_id
+        if holder_id is not None:
+            # Spec 4.4 order: fence the incarnation *before* anything it was
+            # holding becomes available again, so there is no instant in which
+            # the work is free and the runner is still assignable.
+            await fence_agent(store, holder_id, reason=ErrorKind.CANCELLED.value)
         await store.release_leases_for_task(task_id, ErrorKind.CANCELLED.value)
         task = await store.update_task(
             task_id,
@@ -613,9 +582,6 @@ async def cancel_task(task_id: str, server: ServerDep) -> dict[str, Any]:
             error="cancelled by operator",
             completed_at=utcnow(),
         )
-        if holder_id is not None and await store.get_agent(holder_id) is not None:
-            await store.bump_epoch(holder_id)
-            await _free_agent(store, holder_id, task_id)
         await store.emit(EventType.TASK_CANCELLED, task_id=task_id, agent_id=holder_id)
     server.wake.set()
     return {"task": _jsonable(task)}
@@ -757,7 +723,7 @@ async def get_state(server: ServerDep) -> dict[str, Any]:
         "tasks": [_task_view(task, state, now) for task in state.tasks],
         "agents": [_agent_view(agent, now, stale_after) for agent in state.agents],
         "leases": [_jsonable(lease) for lease in state.leases],
-        "counters": _counters(state),
+        "counters": fleet_counters(state),
         "last_event_id": await store.last_event_id(),
         "server_time": isoformat(now),
     }
@@ -786,300 +752,6 @@ async def reset(server: ServerDep) -> dict[str, Any]:
     server.run_finished_emitted = False
     await server.store.emit(EventType.FLEET_STARTED, version=VERSION, reason="reset")
     return {"ok": True}
-
-
-# ---------------------------------------------------------------------------
-# The tick loop
-# ---------------------------------------------------------------------------
-
-
-async def tick(server: ServerState) -> None:
-    """One reconciliation pass: sweep deadlines, schedule, apply.
-
-    The deadline sweep runs first and in its own transaction so the scheduler
-    sees the tasks it freed. Everything the scheduler decides is then applied in
-    one transaction, in the order it returned — a partial or reordered
-    application would co-schedule tasks that must not be co-scheduled.
-    """
-    now = utcnow()
-    state = await server.store.fleet_state(stale_after_s=server.settings.stale_after)
-    if await _sweep_deadlines(server, state, now):
-        state = await server.store.fleet_state(stale_after_s=server.settings.stale_after)
-    await _apply(server, state, schedule(state, now), now)
-
-
-async def _tick_loop(server: ServerState) -> None:
-    """Fast reactive path, slow safety net (spec 4.2).
-
-    The wake event is cleared *before* the pass so that a write landing mid-tick
-    schedules another one rather than being swallowed by it.
-    """
-    while True:
-        with suppress(TimeoutError):
-            await asyncio.wait_for(server.wake.wait(), timeout=server.settings.tick_interval)
-        server.wake.clear()
-        try:
-            await tick(server)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            # A failed pass must not take the fleet down with it: the next sweep
-            # re-derives everything from the database. Loudly logged, never hidden.
-            logger.exception("tick failed")
-
-
-async def _sweep_deadlines(server: ServerState, state: FleetState, now: datetime) -> bool:
-    """Spec 4.7: `assigned_at + task_timeout + grace` requeues even if nobody reports.
-
-    Heartbeat staleness catches a runner that died. This catches one that is
-    wedged — still heartbeating, no longer making progress — which is a different
-    failure with a different clock.
-    """
-    limit = timedelta(seconds=server.settings.task_timeout + server.settings.lease_grace_s)
-    overdue = [
-        task
-        for task in state.tasks
-        if task.status.is_active and task.assigned_at is not None and now - task.assigned_at > limit
-    ]
-    if not overdue:
-        return False
-
-    store = server.store
-    async with store.transaction():
-        for stale in overdue:
-            task = await store.get_task(stale.id)
-            if task is None or not task.status.is_active:
-                continue
-            holder_id = task.assigned_agent_id
-            if holder_id is not None and await store.get_agent(holder_id) is not None:
-                await store.bump_epoch(holder_id)
-                await _free_agent(store, holder_id, task.id)
-            await _requeue(
-                store,
-                task,
-                reason=REQUEUE_DEADLINE,
-                backoff_until=now + backoff_delay(task.attempts),
-            )
-    server.wake.set()
-    return True
-
-
-async def _apply(
-    server: ServerState, state: FleetState, decisions: list[Decision], now: datetime
-) -> None:
-    """Turn decisions into rows and events, in order, in one transaction."""
-    if _has_live_work(state):
-        # A new batch of work reopens the run, so the one-shot fleet events fire
-        # again when it drains.
-        server.fleet_idle_emitted = False
-        server.run_finished_emitted = False
-
-    if not decisions:
-        return
-
-    store = server.store
-    async with store.transaction():
-        for decision in decisions:
-            match decision:
-                case MarkAgentOffline(agent_id=agent_id):
-                    await _apply_mark_offline(store, agent_id, now)
-                case RequeueTask(task_id=task_id, reason=reason, backoff_until=backoff_until):
-                    task = await store.get_task(task_id)
-                    if task is not None and task.status.is_active:
-                        await _requeue(store, task, reason=reason, backoff_until=backoff_until)
-                case FailTask(task_id=task_id, error_kind=error_kind, error=error):
-                    await _apply_fail(store, task_id, error_kind, error, now)
-                case BlockDownstream(task_id=task_id, failed_ancestor_id=ancestor_id):
-                    await _apply_block(store, task_id, ancestor_id)
-                case Assign(task_id=task_id, agent_id=agent_id):
-                    await _apply_assign(server, task_id, agent_id, now)
-                case EmitFleetIdle():
-                    await _apply_fleet_idle(server, state)
-                case _:
-                    # A decision the scheduler emits and this loop ignores is the
-                    # worst failure mode here, because the fleet keeps running and
-                    # simply never does the thing. Adding a `Decision` member with
-                    # no arm now fails the tick instead of passing silently.
-                    raise TypeError(f"no apply step for decision {decision!r}")
-        await _maybe_finish_run(server)
-
-
-async def _apply_mark_offline(store: Store, agent_id: str, now: datetime) -> None:
-    agent = await store.get_agent(agent_id)
-    if agent is None or agent.status is AgentStatus.OFFLINE:
-        return
-    # The epoch bump is the fence: whatever this agent does next gets a 409.
-    await store.update_agent(
-        agent_id, status=AgentStatus.OFFLINE, current_task_id=None, epoch=agent.epoch + 1
-    )
-    released = await store.release_leases_for_agent(agent_id, "agent_stale")
-    await store.emit(
-        EventType.AGENT_OFFLINE,
-        agent_id=agent_id,
-        name=agent.name,
-        reason="stale",
-        last_heartbeat_at=isoformat(agent.last_heartbeat_at),
-        silent_for_s=round((now - agent.last_heartbeat_at).total_seconds(), 3),
-        released_paths=released,
-    )
-
-
-async def _apply_fail(
-    store: Store, task_id: str, error_kind: ErrorKind, error: str, now: datetime
-) -> None:
-    task = await store.get_task(task_id)
-    if task is None or task.status.is_terminal:
-        return
-    await store.release_leases_for_task(task_id, RELEASE_TASK_TERMINAL)
-    await store.update_task(
-        task_id,
-        status=TaskStatus.FAILED,
-        error=error,
-        error_kind=error_kind,
-        completed_at=now,
-    )
-    if task.assigned_agent_id is not None:
-        await _free_agent(store, task.assigned_agent_id, task_id)
-    await store.emit(
-        EventType.TASK_FAILED,
-        task_id=task_id,
-        agent_id=task.assigned_agent_id,
-        attempt=task.attempts,
-        error=error,
-        error_kind=error_kind,
-    )
-
-
-async def _apply_block(store: Store, task_id: str, ancestor_id: str) -> None:
-    task = await store.get_task(task_id)
-    if task is None or task.status.is_terminal:
-        return
-    await store.update_task(
-        task_id,
-        status=TaskStatus.BLOCKED_UPSTREAM,
-        error=f"dependency {ancestor_id} did not succeed",
-    )
-    await store.emit(
-        EventType.TASK_BLOCKED_UPSTREAM, task_id=task_id, failed_ancestor_id=ancestor_id
-    )
-
-
-async def _apply_assign(server: ServerState, task_id: str, agent_id: str, now: datetime) -> None:
-    """Assignment is the claim (spec D4): status, owner, attempt and agent all move here.
-
-    The snapshot the scheduler decided from was read a moment ago, so both rows
-    are re-checked against the transaction — a task that completed in between is
-    skipped rather than resurrected.
-    """
-    store = server.store
-    task = await store.get_task(task_id)
-    agent = await store.get_agent(agent_id)
-    if task is None or task.status is not TaskStatus.PENDING:
-        return
-    if agent is None or agent.status is not AgentStatus.IDLE:
-        return
-    task = await store.update_task(
-        task_id,
-        status=TaskStatus.ASSIGNED,
-        assigned_agent_id=agent_id,
-        assigned_at=now,
-        attempts=task.attempts + 1,
-        backoff_until=None,
-    )
-    await store.update_agent(
-        agent_id, status=AgentStatus.BUSY, current_task_id=task_id, last_assigned_at=now
-    )
-    await store.emit(
-        EventType.TASK_ASSIGNED,
-        task_id=task_id,
-        agent_id=agent_id,
-        agent_name=agent.name,
-        attempt=task.attempts,
-        deadline=isoformat(_deadline(task, server.settings)),
-        file_scope=list(task.file_scope),
-    )
-
-
-async def _apply_fleet_idle(server: ServerState, state: FleetState) -> None:
-    """`fleet_idle` is an edge, not a condition.
-
-    The scheduler reports the condition on every idle tick, which is the right
-    shape for a pure function; turning that into the one event of spec 4.8 is the
-    server's job, and an empty database is not an idle fleet — it is a fleet with
-    nothing to do yet.
-    """
-    if server.fleet_idle_emitted or not state.tasks:
-        return
-    server.fleet_idle_emitted = True
-    await server.store.emit(EventType.FLEET_IDLE, **_counters(state))
-
-
-async def _maybe_finish_run(server: ServerState) -> None:
-    if not server.fleet_idle_emitted or server.run_finished_emitted:
-        return
-    agents = await server.store.list_agents()
-    if any(agent.status is AgentStatus.BUSY for agent in agents):
-        return
-    server.run_finished_emitted = True
-    tasks = await server.store.list_tasks(limit=SCAN_LIMIT)
-    await server.store.emit(
-        EventType.RUN_FINISHED,
-        tasks=len(tasks),
-        succeeded=sum(1 for task in tasks if task.status is TaskStatus.SUCCEEDED),
-        failed=sum(1 for task in tasks if task.status is TaskStatus.FAILED),
-        blocked_upstream=sum(1 for task in tasks if task.status is TaskStatus.BLOCKED_UPSTREAM),
-        cancelled=sum(1 for task in tasks if task.status is TaskStatus.CANCELLED),
-        cost_usd=round(sum(task.cost_usd for task in tasks), 6),
-        input_tokens=sum(task.input_tokens for task in tasks),
-        output_tokens=sum(task.output_tokens for task in tasks),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Shared state transitions
-# ---------------------------------------------------------------------------
-
-
-async def _requeue(store: Store, task: Task, *, reason: str, backoff_until: datetime) -> None:
-    """Back to `pending`, leases released in the same transaction that moves it.
-
-    `attempts` is not touched: it counts transitions into `assigned`, so a lost
-    assignment already cost an attempt and a requeue must not charge a second.
-    """
-    await store.release_leases_for_task(task.id, RELEASE_TASK_REQUEUED)
-    await store.update_task(
-        task.id,
-        status=TaskStatus.PENDING,
-        assigned_agent_id=None,
-        assigned_at=None,
-        started_at=None,
-        backoff_until=backoff_until,
-    )
-    await store.emit(
-        EventType.TASK_REQUEUED,
-        task_id=task.id,
-        agent_id=task.assigned_agent_id,
-        reason=reason,
-        attempts=task.attempts,
-        backoff_until=isoformat(backoff_until),
-    )
-
-
-async def _reclaim(store: Store, agent_id: str, *, reason: str) -> None:
-    """Take back everything an agent was holding: leases first, then its work."""
-    await store.release_leases_for_agent(agent_id, reason)
-    for task in await _active_tasks_of(store, agent_id):
-        await _requeue(
-            store, task, reason=reason, backoff_until=utcnow() + backoff_delay(task.attempts)
-        )
-
-
-async def _free_agent(store: Store, agent_id: str, task_id: str) -> None:
-    """Return an agent to `idle`, but only if it is still holding this task."""
-    agent = await store.get_agent(agent_id)
-    if agent is None or agent.current_task_id != task_id:
-        return
-    await store.update_agent(agent_id, status=AgentStatus.IDLE, current_task_id=None)
 
 
 async def _cascade_unblocked(store: Store, task_id: str) -> list[str]:
@@ -1129,17 +801,6 @@ async def _has_succeeded(store: Store, task_id: str) -> bool:
     return task is not None and task.status is TaskStatus.SUCCEEDED
 
 
-async def _active_tasks_of(store: Store, agent_id: str) -> list[Task]:
-    tasks: list[Task] = []
-    for status in (TaskStatus.ASSIGNED, TaskStatus.RUNNING):
-        tasks += [
-            task
-            for task in await store.list_tasks(status=status, limit=SCAN_LIMIT)
-            if task.assigned_agent_id == agent_id
-        ]
-    return tasks
-
-
 async def _require_task(store: Store, task_id: str) -> Task:
     task = await store.get_task(task_id)
     if task is None:
@@ -1156,10 +817,6 @@ def _require_owner(task: Task, agent: Agent) -> None:
             task_id=task.id,
             assigned_agent_id=task.assigned_agent_id,
         )
-
-
-def _has_live_work(state: FleetState) -> bool:
-    return any(task.status is TaskStatus.PENDING or task.status.is_active for task in state.tasks)
 
 
 # ---------------------------------------------------------------------------
@@ -1237,27 +894,8 @@ def _assignment_view(task: Task, settings: Settings) -> dict[str, Any]:
         "priority": task.priority,
         "file_scope": list(task.file_scope),
         "attempts": task.attempts,
-        "deadline": isoformat(_deadline(task, settings)),
+        "deadline": isoformat(task_deadline(task, settings)),
         "blocked_on_path": task.blocked_on_path,
-    }
-
-
-def _deadline(task: Task, settings: Settings) -> datetime:
-    started = task.assigned_at or utcnow()
-    return started + timedelta(seconds=settings.task_timeout)
-
-
-def _counters(state: FleetState) -> dict[str, Any]:
-    tasks_by_status = {status.value: 0 for status in TaskStatus}
-    for task in state.tasks:
-        tasks_by_status[task.status.value] += 1
-    agents_by_status = {status.value: 0 for status in AgentStatus}
-    for agent in state.agents:
-        agents_by_status[agent.status.value] += 1
-    return {
-        "tasks": tasks_by_status,
-        "agents": agents_by_status,
-        "leases": len(state.leases),
     }
 
 
@@ -1280,7 +918,7 @@ def create_app(settings: Settings) -> FastAPI:
             workdir=str(settings.workdir),
             tick_interval_s=settings.tick_interval,
         )
-        ticker = asyncio.create_task(_tick_loop(server), name="codefleet-tick")
+        ticker = asyncio.create_task(tick_loop(server), name="codefleet-tick")
         try:
             yield
         finally:

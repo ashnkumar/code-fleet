@@ -10,6 +10,13 @@ before it overwrites the first one's file.
 That recording is a real run — three runners, five tasks, live Claude Agent SDK sessions. The red
 `VETO` line is a write that did not happen.
 
+It is also a real race, which is worth being precise about. Two of the five tasks declare different
+files but both end up needing `api.py`, and whichever agent asks second is denied. Across live runs
+that fires most of the time but not every time — sometimes one agent finishes and releases the file
+before the other gets there, and the run reports that no write was vetoed. Which agent loses varies
+too. `--dry-run` scripts the timing, so there the veto is deterministic; that is the version CI
+asserts on.
+
 ## The problem
 
 Starting several coding agents on one repository is easy. Finishing is not, because two things go
@@ -52,8 +59,8 @@ which is most of the install time.
 
 `codefleet demo` copies `examples/demo-repo` to a scratch workspace, starts the server, loads a
 five-task graph, runs three agents against it, renders the dashboard, and finishes by running the
-target repository's own test suite. It leaves your checkout untouched. A run costs roughly $0.25 and
-takes about a minute on the default model.
+target repository's own test suite. It leaves your checkout untouched. On the default model a run
+costs about $0.20 and finishes in under a minute.
 
 No API key, or want to see the machinery without spending anything:
 
@@ -81,8 +88,9 @@ uv run codefleet tasks --json               # machine-readable state
 ```
 
 Point it at your own code with `CODEFLEET_WORKDIR`, and write your own graph in the shape of
-`examples/demo-tasks.yaml`. Every setting is an environment variable with a `CODEFLEET_` prefix and
-also a flag; `.env.example` lists all of them.
+`examples/demo-tasks.yaml`. Every setting is an environment variable with a `CODEFLEET_` prefix, and
+every one except `CODEFLEET_RUN_DIR` is also a flag on the command it applies to — `--help` on that
+command lists them. `.env.example` lists all of them, with defaults.
 
 ## How it works
 
@@ -120,13 +128,16 @@ Start with `src/codefleet/scheduler.py`. It is the core of the whole thing and i
 
 ### The interesting decision
 
-The veto is a `PreToolUse` hook. Two more obvious options were tried first and rejected on evidence:
+The veto is a `PreToolUse` hook. Two more obvious options were rejected first, each for a reason you
+can re-check against the SDK:
 
 - **`can_use_tool`** looks like the right API — a permission callback the host controls. It requires
   streaming-input mode, and it is *shadowed* the moment you set `permission_mode="bypassPermissions"`.
-  The SDK raises `CanUseToolShadowedWarning` and points you at `PreToolUse` itself.
-- **`permission_mode="acceptEdits"`** did not write in a headless run. Tested: sessions completed,
-  reported success, and had changed nothing on disk. `bypassPermissions` wrote correctly.
+  The SDK emits a `CanUseToolShadowedWarning` that points you at `PreToolUse` itself.
+- **`permission_mode="acceptEdits"`** auto-accepts file edits and leaves every other tool on the
+  standard permission path, which prompts — and an unattended runner has nobody to answer a prompt.
+  It also buys nothing back: the deny still has to arrive as a `PreToolUse` hook either way, since
+  that is the only place the server's answer can reach a tool call before it runs.
 
 So: `bypassPermissions` plus a hook matched on `Write|Edit|MultiEdit|NotebookEdit`, which asks the
 server and returns `deny` when the file is spoken for.
@@ -134,8 +145,9 @@ server and returns `deny` when the file is spoken for.
 The cost of that choice, stated plainly: **the coordination server becomes the only thing standing
 between an agent and the filesystem.** `bypassPermissions` takes the CLI's own permission rules out of
 play. That is why the hook fails *closed* when the server is unreachable, why any path resolving
-outside the working tree is denied locally, and why the hook body does nothing but one loopback call
-with a hard timeout.
+outside the working tree is denied locally, why the hook body does nothing but one loopback call with
+a hard timeout, and why the session's tool set is an explicit allowlist with no shell on it — a write
+the matcher never sees is a write the server never gets to veto.
 
 Leases are per file and acquired lazily, at the first write — not up front from the declared
 `file_scope`. Declared scope is a guess someone wrote before the agent read the code, and agents
@@ -155,8 +167,8 @@ alternatives that were considered and dropped.
 ## Tests
 
 ```bash
-uv run pytest              # 183 tests, no network, no API key
-uv run pytest -m live      # the two that spend money
+uv run pytest              # everything except the live tier: no network, no API key
+uv run pytest -m live      # the live tier, which spends money
 ```
 
 The whole coordination suite runs against a `ScriptedExecutor` — a runner whose brain is a script
@@ -187,6 +199,14 @@ Real ones, not modesty.
   graph for you.
 - **Agents are told to stay in scope, not forced to.** `file_scope` shapes scheduling and appears in
   the prompt. The lease is the enforcement; everything before it is advice.
+- **Agents cannot run commands.** The session is given exactly
+  `Read`/`Write`/`Edit`/`MultiEdit`/`NotebookEdit`/`Glob`/`Grep`; `Bash` is deliberately not among
+  them. Bash is a write path the veto cannot see: `sed -i`, a formatter, `cat > file` — none of it
+  reaches a hook matched on tool names, so it would take no lease and appear in no ledger row, and
+  the veto would hold for structured edits while silently not holding for shell ones. Gating it
+  instead means deciding what an arbitrary shell command writes. The price is paid by the tasks: one
+  cannot run the tests it just wrote, or a linter, or `git`. Verification happens to the tree after
+  the fleet drains — which is what `codefleet demo` does with the target repository's own suite.
 - **POSIX only.** Tested on macOS and Linux.
 
 ## License

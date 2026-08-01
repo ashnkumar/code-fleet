@@ -1,7 +1,7 @@
 # CodeFleet — specification
 
-Status: design settled, implementation pending. This document is the contract the code is written
-against and the tests are written from.
+Status: implemented. This document is the contract the code is written against and the tests are
+written from; where the two disagree, one of them is a bug.
 
 ---
 
@@ -45,14 +45,17 @@ want to know what the fleet did, you read one table.
 
 | Component | Module | Responsibility |
 | --- | --- | --- |
-| Coordination server | `codefleet.server` | FastAPI app. Owns the HTTP API, the SQLite store, the scheduler tick loop, the SSE stream. One process. |
+| Coordination server | `codefleet.server` | FastAPI app. The HTTP API, the SSE stream, the app factory — the wire: request in, transition, response and event out. One process. |
+| Engine | `codefleet.engine` | The tick loop and every transition it applies. Sits between the scheduler and the server and imports no web framework: the rules here are about rows and events, not requests. |
 | Store | `codefleet.store` | aiosqlite, WAL mode. All persistence. Every write in the system goes through here. |
 | Scheduler | `codefleet.scheduler` | `schedule(state, now) -> list[Decision]`. Pure function. No I/O, no async, no database, no clock of its own. |
-| Runner | `codefleet.runner` | Thin agent process. Registers, heartbeats, polls, runs one SDK session per task, reports. Target ~200 lines. |
+| Runner | `codefleet.runner` | Thin agent process. Registers, heartbeats, polls, runs one SDK session per task, reports. Thin is defined by what it may not import — neither `codefleet.store` nor `codefleet.scheduler` — not by a line budget; `tests/unit/test_boundaries.py` enforces it. |
 | SDK session | `codefleet.session` | Builds `ClaudeAgentOptions`, installs the two hooks, drains the message stream, extracts usage. |
-| CLI | `codefleet.cli` | `codefleet serve`, `codefleet run`, `codefleet watch`, `codefleet tasks`, `codefleet demo`, `codefleet reset`. |
+| CLI | `codefleet.cli` | `codefleet serve`, `codefleet run`, `codefleet watch`, `codefleet tasks`, `codefleet load`, `codefleet demo`, `codefleet doctor`, `codefleet reset`. |
 | Dashboard | `codefleet.dashboard` | Rich terminal view. Consumes `GET /events/stream`. Read-only; holds no state the server does not have. |
-| Demo target | `examples/demo-repo` | `linkstash`, a ~200-line stdlib URL shortener with a passing test suite. The codebase the fleet edits. |
+| Models | `codefleet.models` | Entities, transient DTOs, and every enum the rest of the system is typed against — including the gated write-tool set the hook matcher is built from. |
+| Configuration | `codefleet.config` | `Settings`. One environment-backed object, no config file; `.env.example` is its documentation. |
+| Demo target | `examples/demo-repo` | `linkstash`, a ~130-line stdlib URL shortener with a passing test suite of its own. The codebase the fleet edits. |
 | Demo graph | `examples/demo-tasks.yaml` | Five tasks shaped to force one real dependency cascade and one real write veto. |
 
 ### Diagram
@@ -77,10 +80,11 @@ want to know what the fleet did, you read one table.
                           └────┬─────┘       └────┬─────┘       └────┬─────┘
                                │  one Claude Agent SDK session per task
                                │
-                               │  PreToolUse  Write|Edit|MultiEdit ──▶ POST /leases/acquire
-                               │                                        ──▶ allow  →  write proceeds
-                               │                                        ──▶ deny   →  write vetoed
-                               │  PostToolUse Write|Edit|MultiEdit ──▶ POST /changes  (ledger)
+                               │  PreToolUse  <write tools> ──▶ POST /leases/acquire
+                               │                               ──▶ allow  →  write proceeds
+                               │                               ──▶ deny   →  write vetoed
+                               │  PostToolUse <write tools> ──▶ POST /changes  (ledger)
+                               │  <write tools> = Write|Edit|MultiEdit|NotebookEdit
                                ▼
                      ┌───────────────────────────────────────┐
                      │  ONE shared working tree              │
@@ -92,8 +96,8 @@ want to know what the fleet did, you read one table.
 
 - Runners talk to the server over HTTP only. They never touch the database.
 - The server never calls a runner. All traffic is runner→server or operator→server.
-- The scheduler is called by the server's tick loop and returns decisions; the loop applies them
-  inside a single transaction. The scheduler itself cannot write anything.
+- The scheduler is called by the engine's tick loop, in the server process, and returns decisions;
+  the loop applies them inside a single transaction. The scheduler itself cannot write anything.
 - The dashboard is a pure consumer of the SSE stream. Turning it off changes nothing.
 
 ---
@@ -106,7 +110,7 @@ Every `datetime` in Python is aware; naive datetimes are rejected at the model b
 
 IDs are text. Tasks may carry a caller-supplied id (`T1`) so a YAML graph can express its own edges;
 otherwise the server generates `t_<12 hex>`. Agents get `a_<12 hex>` at first registration and keep
-it across restarts (see §3.4).
+it across restarts (§3.3, §4.4).
 
 ### 3.1 `tasks`
 
@@ -163,6 +167,7 @@ graph either lands whole or not at all.
 | `workdir` | TEXT NOT NULL | absolute path the runner actually passes as SDK `cwd`. Written, not decorative. |
 | `pid` | INTEGER NULL | |
 | `last_heartbeat_at` | TEXT NOT NULL | |
+| `last_assigned_at` | TEXT NULL | when this slot last took work. The scheduler's tiebreak: idle agents are picked longest-idle first (§4.2 step 4). |
 | `tasks_succeeded` | INTEGER NOT NULL | lifetime, survives restarts |
 | `tasks_failed` | INTEGER NOT NULL | lifetime |
 | `input_tokens` | INTEGER NOT NULL | lifetime |
@@ -260,9 +265,8 @@ fleet_started       fleet_idle         run_finished
 ```
 
 Deliberately absent: `heartbeat`. Heartbeats are a liveness signal, not a state change; emitting one
-per agent per interval would flood the table that the dashboard and the recording read from. The
-reference's seed corpus contains 17 synthetic heartbeat events its runner never produced
-(`reference/data/seed_activity.json` vs `reference/src/runners/base.py:441-450`).
+per agent per interval would flood the table that the dashboard and the recording read from, at a
+rate proportional to fleet size and unrelated to how much work is happening.
 
 ### 3.9 Transient DTOs (not persisted as tables)
 
@@ -274,25 +278,28 @@ and it is exactly the body of `POST /tasks/{id}/complete`.
 `FleetState` — a frozen snapshot (`tasks`, `deps`, `agents`, `leases`, `now`) handed to the pure
 scheduler. Constructed literally in unit tests.
 
-### 3.10 What was cut from the reference model, and why
+### 3.10 Fields deliberately not modelled
 
-| Cut | Reference site | Why |
-| --- | --- | --- |
-| `description_semantic` / `semantic_text` / `dense_vector` embeddings | `reference/elastic/indices/tasks.json:12-15`, hand-derived in 4 places incl. `reference/src/cli/main.py:119` | Elastic-only. Its one consumer was `find_similar_tasks`. Semantic dedup of tasks is a non-goal. The field existed in no model, and the shipped mapping contradicted the spec's `dense_vector`. |
-| Kibana dashboards, data views, NDJSON | `reference/dashboards/` | The shipped dashboard object had no `panelsJSON` and empty `references` — it imported as a titled, empty dashboard, and its own README told you to rebuild the panels by hand. Replaced by SSE + a terminal dashboard that reads the same table. |
-| ES\|QL tools, Agent Builder agent definitions | `reference/elastic/tools/`, `reference/elastic/agents/` | The planner surface (task decomposition by an LLM) moves out of scope. Tasks come from a file or the API. |
-| `blocked_by` | `reference/src/models.py:87` | Double-booked with `depends_on`. Maintained by a Painless script that had to branch on List-vs-String because the two creation paths disagreed (`reference/elastic/workflows/handle_task_completion.yaml:46-54`). Its seed data contradicted itself. Now derived from `task_dependencies`. |
-| `estimated_complexity` | `reference/src/models.py:94` | Never read by anything. Its validator silently downgraded unknown values to `medium`. |
-| `labels` | `reference/src/models.py:89` | Never read by anything. |
-| `Agent.capabilities` | `reference/src/models.py:145` | Always `[]` in production — neither `manager.py:91` nor `cli/main.py:73` passed it — and no consumer existed; the assigner matched on `status: idle` and took `hits[0]`. Capability routing is a non-goal. |
-| `Agent.type` | `reference/src/models.py:141` | One value (`"claude"`), not an enum. |
-| `Task.branch_name`, `Task.pr_url` | `reference/src/models.py:90-91` | Never written. Git automation is a non-goal (§9). |
-| `Agent.session_id` | `reference/src/models.py:147` | Write-only, and written *after* the session ended, so it could never be used to resume. Session id belongs to the attempt, so it moves to `tasks.session_id`. |
-| `FileChange.commit_sha`, `lines_added`, `lines_removed`, `branch_name` | `reference/src/models.py:178-181` | Never written. Line counts belong to a `git diff` feature that does not exist here. |
-| `Conflict.agent_ids` / `task_ids` / `file_paths` parallel arrays | `reference/src/models.py:187-189` | Three unpaired lists lose the association — given two of each you cannot say who touched what. Replaced by one row per (path, holder, requester). |
-| `ConflictStatus` (`detected`/`resolving`/`resolved`/`escalated`) | `reference/src/models.py:65-70` | No code anywhere drove those transitions and there was no story for who would. |
-| `AgentStatus.paused`, `AgentStatus.error` | `reference/src/models.py:32-34` | Unreachable — never assigned by anything. |
-| `ActivityEvent.agent_id` as required | `reference/src/models.py:159` | Made server-originated events unrepresentable, which is why three workflows wrote activity docs the model could not deserialize. Now nullable. |
+The schema above is small on purpose. Each of the following is an obvious thing to put in a task or
+agent row, and each is left out for a reason worth stating.
+
+| Not modelled | Why |
+| --- | --- |
+| Embeddings of the task description (`semantic_text`, `dense_vector`, or similar) | Their only consumer would be a "find similar tasks" query. Semantic dedup of tasks is a non-goal (§8). An embedding column commits the schema, the write path and a model dependency to a feature nothing in the coordination path reads. |
+| A dashboard definition format (saved objects, data views, NDJSON) | The dashboard is a client of `GET /events/stream`, not a document imported into a separate tool. A dashboard that ships as a definition file has to be re-created wherever it lands; one that reads the events table works the moment the server is up. |
+| Planner artifacts — decomposition prompts, tool and agent declarations | Tasks come from a YAML file or `POST /tasks`. Task decomposition by an LLM is out of scope (§8, D17). |
+| `blocked_by` on the task | It double-books `task_dependencies`. Two stored representations of one graph need something to keep them equal, and every write path that touches one and not the other is drift — the failure mode being a task whose `depends_on` is set, whose blocker list is empty, and which is therefore immediately eligible for assignment. Runnability is derived instead (§4.1). |
+| `estimated_complexity` | Nothing would read it, and nothing here schedules on it — ordering is `(priority, created_at, id)`. A field whose validator quietly coerces an unrecognised value to a default is worse than no field: it accepts bad input and hands back a confident answer. |
+| `labels` | Nothing would read it. Free-form tagging is a task-tracker feature; the scheduler needs `priority`, `file_scope` and the edge table. |
+| `Agent.capabilities` | Capability routing is a non-goal (§8). Any idle agent can take any task, so the assigner matches on `status` and idleness alone, and there is nothing on the task side to match capabilities against. |
+| `Agent.type` | One value. A single-member enum is a column that carries no information. |
+| `Task.branch_name`, `Task.pr_url` | Git automation is a non-goal (§8). |
+| `Agent.session_id` | A session belongs to an attempt, not to an agent. An agent outlives many sessions, so a session id parked on the agent row is overwritten by the next task and cannot identify the one you want. It lives on `tasks.session_id`. |
+| `FileChange.commit_sha`, `lines_added`, `lines_removed`, `branch_name` | Line counts and commits belong to a `git diff` feature that does not exist here (§8). The ledger records which tool touched which path, at the instant it touched it. |
+| Parallel `agent_ids` / `task_ids` / `file_paths` arrays on a conflict | Three unpaired lists lose the association — given two of each you cannot say who touched what. One row per (path, holder, requester) keeps it (§3.6). |
+| A `ConflictStatus` lifecycle (`detected` / `resolving` / `resolved` / `escalated`) | Every state in a lifecycle needs something that drives the transition into it and something that acts on it. Neither exists here. Resolution is derived from the requester task's current status instead (§3.6). |
+| `AgentStatus.paused`, `AgentStatus.error` | Unreachable: no code path would assign either. `idle` / `busy` / `offline` is the whole lifecycle, and an error is a property of a task attempt, not of an agent. |
+| A required `agent_id` on events | It would make server-originated events unrepresentable, and there are plenty of them — `fleet_idle`, `task_created`, `task_blocked_upstream` belong to no agent. Nullable (§3.7). |
 
 ---
 
@@ -310,10 +317,10 @@ A task is **runnable** at instant `now` iff all of:
 3. `attempts < max_attempts`
 4. `backoff_until is null or backoff_until <= now`
 
-There is no stored `blocked` flag and no `blocked` status. Blockedness is a join. The fleet-sized
-data makes the join free, and it removes the entire class of drift the reference had — where
-`depends_on` was set and `blocked_by` was empty, so a task with an unmet dependency was immediately
-eligible for assignment (`reference/src/cli/main.py:103-112`).
+There is no stored `blocked` flag and no `blocked` status. Blockedness is a join. At fleet-sized data
+the join is free, and it removes an entire class of drift: a stored blocker list is a cached answer,
+and any write path that updates the edges without updating the cache leaves a task with an unmet
+dependency looking immediately eligible for assignment.
 
 ### 4.2 Assignment
 
@@ -351,13 +358,16 @@ been made and durably recorded — it cannot lose a race it was never in.
 readiness — task created, task terminal, lease released, agent registered, agent went idle — or
 (b) a 500 ms timer, as a reconciliation sweep. Fast reactive path, slow safety net.
 
-**Why the reference's cadence is wrong.** `reference/elastic/workflows/auto_assign_tasks.yaml` fires
-`every: 30s` (line 11) and, despite fetching `size: 10` tasks and `size: 10` agents (lines 20, 39),
-indexes only `hits.hits[0]` of each (lines 52, 55) with no `foreach` step — though `foreach` is used
-correctly in two sibling workflows. So it assigns exactly one pair per tick: a five-runner fleet
-takes 150 seconds to become fully busy, and throughput is capped at two tasks per minute regardless
-of fleet size. The README advertised 5 s in three places (`reference/README.md:30, 58, 153`). Both
-halves of that are bugs — the interval *and* the single-pair body — and the second is the worse one.
+**Why the tick is a batch, and why it lives in this process.** Assignment is a matching loop over all
+idle agents, not a single pair per tick. A per-tick single assignment caps fleet throughput at one
+task per interval regardless of how many runners are idle — a five-runner fleet needs five ticks
+merely to become fully busy, and no amount of shortening the interval fixes the shape of that. The
+interval and the body are two separate knobs and the body is the one that matters.
+
+The loop is ordinary Python in the server process rather than a definition handed to an external
+workflow engine. That keeps the policy callable from a unit test with no infrastructure standing
+(§6.3), and it means there is no deploy step whose silent failure would leave the fleet running with
+no scheduler at all.
 
 ### 4.3 Dependency cascade
 
@@ -371,10 +381,11 @@ No status is mutated by the cascade. `pending` tasks were already `pending`; the
 runnable. `task_unblocked` is emitted for observability, not because anything reads it back.
 
 On `task_failed` or `task_cancelled`, transitively mark every downstream dependent
-`blocked_upstream` and emit `task_blocked_upstream` with the failing ancestor id in the payload. The
-reference had no path here at all: `fail_task` did not fire the completion workflow
-(`reference/src/runners/base.py:390` vs `:397-429`), so dependents of a failed task sat `pending`
-forever with no signal, and the fleet looked idle while work was silently stranded.
+`blocked_upstream` and emit `task_blocked_upstream` with the failing ancestor id in the payload.
+Failure has to cascade as deliberately as success does. If only the success path fires a cascade,
+dependents of a failed task sit `pending` forever with no signal: they are never runnable, nothing
+ever says so, and the fleet reads as idle-and-healthy while work is silently stranded. Naming the
+failing ancestor is what makes that state diagnosable and what `retry` walks back.
 
 `POST /tasks/{id}/retry` on a `failed` task resets it to `pending` with `attempts = 0`, and
 recursively returns its `blocked_upstream` dependents to `pending`.
@@ -394,12 +405,10 @@ When the scheduler observes `now - last_heartbeat_at > stale_after` for an agent
    `error_kind=attempts_exhausted` if `attempts >= max_attempts`), with `backoff_until` set.
 4. `emit(agent_offline)`, `emit(task_requeued)`, set the wakeup event.
 
-Note the requeue covers **both** `assigned` and `running`. The reference matched only
-`status: assigned` (`reference/elastic/workflows/handle_stale_agents.yaml:56-59`) while the runner
-flipped the task to `in_progress` the moment it picked it up
-(`reference/src/runners/base.py:175-183`), so the window in which recovery helped was milliseconds
-wide and a task orphaned by a dying agent stayed `in_progress` forever, recoverable only by a manual
-CLI reset.
+Note the requeue covers **both** `assigned` and `running`. A runner flips its task to `running` as
+soon as it picks it up, so recovering only `assigned` tasks would leave the recovery window
+milliseconds wide: in practice every task orphaned by a dying agent would sit `running` forever,
+holding its leases, recoverable only by a human running a reset.
 
 **Fencing.** Bumping `epoch` is what makes the requeue safe. Every runner→server call carries
 `X-Agent-Epoch`. A zombie runner that comes back to life after its task was reassigned gets `409
@@ -408,16 +417,15 @@ re-registers. Without this, a stale-but-alive process could write to a task anot
 
 **Recovery.** An `offline` agent that heartbeats again returns to `idle` and emits `agent_online`.
 Re-registering under the same `name` reuses the same row and bumps `epoch`, so lifetime counters
-accumulate across restarts. The reference could not do either: `offline` agents were excluded from
-the stale sweep by a `must_not` clause and their heartbeat loop only bumped a timestamp, so the fleet
-shrank monotonically and never grew back
-(`reference/elastic/workflows/handle_stale_agents.yaml:25-27`, `reference/src/runners/base.py:441-450`).
+accumulate across restarts. Both halves matter. If a heartbeat only refreshed a timestamp without
+restoring status, and the sweep that watches agents ignored the `offline` ones, the fleet would
+shrink monotonically over a long run and no restart could grow it back.
 
 **Two independent failure modes, two independent mechanisms.** Heartbeat staleness catches a *dead*
-runner. It cannot catch a *wedged* one — the reference's heartbeat loop and work loop were separate
-asyncio tasks, so a hung SDK session heartbeated cheerfully forever
-(`reference/src/runners/base.py:143-145`, no timeout anywhere). CodeFleet adds a per-task wall-clock
-timeout (§4.7) enforced on both sides.
+runner. It cannot catch a *wedged* one: the heartbeat loop and the work loop are separate asyncio
+tasks by necessity, so a runner whose SDK session has hung goes on heartbeating cheerfully and looks
+perfectly healthy to a liveness check. CodeFleet therefore adds a per-task wall-clock timeout (§4.7)
+enforced on both sides — liveness and progress are different questions and need different answers.
 
 ### 4.5 File leases
 
@@ -469,8 +477,8 @@ and therefore no deadlock. The cost is wasted work, not a stall — and the atte
 A denial is one `lease_denied` event and nothing else (§3.6). `GET /conflicts` projects those events
 against the requester task's current status, so a conflict reads as `resolved` exactly when the task
 that was denied has since succeeded. There is no resolution workflow, no escalation state and no
-approval queue — the reference shipped four such statuses with nothing driving any transition
-between them.
+approval queue: each of those is a state that needs an actor to enter it and an actor to leave it,
+and here there is neither. A status nobody drives is a status that is always wrong.
 
 ### 4.7 Retries, attempt caps, and timeouts
 
@@ -490,9 +498,11 @@ clock, turn count, and dollar budget. In the worst case it lands in `failed` wit
 `error_kind=attempts_exhausted` and `blocked_on_path` set, its dependents go `blocked_upstream`, and
 the fleet drains cleanly instead of livelocking.
 
-The reference had none of this. `failed` was terminal on the first attempt, there was no retry count
-field, no backoff, no timeout, and the only escape was a manual CLI command
-(`reference/src/runners/base.py:397-405`, `reference/src/cli/main.py:321-339`).
+None of these bounds is optional, and each removes a state whose only exit is a human typing a
+command. Without an attempt count, `failed` is terminal on the first stumble and a transient error
+costs the whole task. Without backoff, a retry re-collides with the same holder immediately. Without
+a wall clock, a wedged session is invisible to a liveness check that only watches heartbeats and the
+task never ends at all.
 
 ### 4.8 Run completion
 
@@ -621,8 +631,8 @@ no-op `200`.
 | `POST` | `/reset` | Truncates everything. `403` unless `CODEFLEET_ALLOW_RESET=1`. |
 
 Every read endpoint returns JSON, and the CLI renders it. There is no data path that exists only as
-formatted terminal text — the reference's CLI had no machine-readable output at all, which is why
-none of its commands had an offline test.
+formatted terminal text: a command whose output exists only as a rendered table has nothing to assert
+on but its formatting, which is why such commands end up with no test at all.
 
 ### 5.3 SSE stream
 
@@ -657,7 +667,7 @@ Environment, `CODEFLEET_` prefix, every variable listed in a committed `.env.exa
 | --- | --- | --- |
 | `CODEFLEET_HOST` / `CODEFLEET_PORT` | `127.0.0.1` / `8099` | |
 | `CODEFLEET_DB` | `./codefleet.db` | |
-| `CODEFLEET_WORKDIR` | `./examples/demo-repo` | The shared tree. |
+| `CODEFLEET_WORKDIR` | `./examples/demo-repo` | The shared tree. It defaults to the target repo that ships with this one, never to the current directory — a first run points N `bypassPermissions` sessions at a known throwaway checkout rather than at whatever the operator happened to be standing in. |
 | `CODEFLEET_RUNNERS` | `3` | |
 | `CODEFLEET_MODEL` | `claude-haiku-4-5-20251001` | Overridable. |
 | `CODEFLEET_TASK_TIMEOUT` | `600` | Seconds. |
@@ -665,13 +675,17 @@ Environment, `CODEFLEET_` prefix, every variable listed in a committed `.env.exa
 | `CODEFLEET_MAX_TURNS` | `40` | |
 | `CODEFLEET_HEARTBEAT_INTERVAL` | `5` | Seconds. |
 | `CODEFLEET_STALE_AFTER` | `20` | Seconds. |
+| `CODEFLEET_POLL_INTERVAL` | `1` | Seconds; how often a runner asks for an assignment. |
 | `CODEFLEET_TICK_INTERVAL` | `0.5` | Seconds; the reconciliation sweep. |
 | `CODEFLEET_MAX_ATTEMPTS` | `3` | |
+| `CODEFLEET_RUN_DIR` | `./runs` | Where `codefleet demo` puts each run's workspace, database and per-runner stderr, one timestamped directory per run; `codefleet run` writes its per-runner stderr straight into it. |
 | `CODEFLEET_ALLOW_RESET` | unset | Guards `POST /reset`. |
 | `ANTHROPIC_API_KEY` | — | Read by the SDK, not by CodeFleet. |
 
-`codefleet serve --help` and `codefleet run --help` list the same knobs as flags. Nothing is read
-from a config file the code does not document.
+Every setting above is also a flag on the command it applies to — `codefleet serve --help` carries
+the server and liveness knobs, `codefleet run --help` the fleet and session ones — with the single
+exception of `CODEFLEET_RUN_DIR`, which is environment-only. Nothing is read from a config file the
+code does not document.
 
 ---
 
@@ -679,8 +693,8 @@ from a config file the code does not document.
 
 ### 6.1 The write veto is a `PreToolUse` hook returning `deny`
 
-This is the load-bearing mechanism, and the two obvious alternatives were tried and rejected on
-evidence, not taste.
+This is the load-bearing mechanism, and the two obvious alternatives were rejected on reasons that
+can be re-checked against the SDK, not on taste.
 
 **Rejected: `can_use_tool`.** It looks like the right API — a permission callback the host controls.
 It is not usable here. It requires streaming-input mode (`ValueError` otherwise), and it is
@@ -690,9 +704,18 @@ also shadowed by any whole-tool entry in `allowed_tools` (`"Write"`, `"Write()"`
 by `skills="all"`, which silently appends a bare `Skill` entry. Too many ways to disable it by
 accident.
 
-**Rejected: `permission_mode="acceptEdits"`.** Tested headless. Sessions completed, reported success,
-and had written nothing. `bypassPermissions` wrote correctly. So `acceptEdits` is not a viable
-posture for an unattended runner, and the safety it appears to buy is illusory.
+**Rejected: `permission_mode="acceptEdits"`.** It auto-accepts file edits and leaves everything else
+on the standard permission path, which prompts (`ClaudeAgentOptions.permission_mode`,
+claude-agent-sdk 0.2.128). An unattended runner has nobody to answer a prompt. It also buys none of
+the machinery back: the veto still has to arrive as a `PreToolUse` deny either way, because that is
+the only place the server's answer can reach the tool call before it runs. So `acceptEdits` is a
+weaker posture for the same amount of code.
+
+An earlier revision of this section claimed something stronger — that headless `acceptEdits` sessions
+completed, reported success, and had written nothing at all. That does not reproduce against the
+pinned SDK: `acceptEdits` writes, both through a bare `query()` and through this repository's own
+`run_session` with its hooks installed. Nothing in the repository ever demonstrated the no-write
+result, so the claim is withdrawn rather than re-explained.
 
 **Chosen: `bypassPermissions` + a `PreToolUse` hook.** Empirically, a hook returning
 `permissionDecision: "deny"` vetoes the write, and the denied agent stops cleanly and reports being
@@ -707,6 +730,27 @@ workdir, and why the hook body does nothing but one loopback HTTP call with a ha
 `PreToolUse` hook that misses its deadline does not fall through to the tool; the CLI stops the turn
 with "the tool call was not executed", which would look like a mysterious agent failure.
 
+**The session is given an explicit tool set, and `Bash` is not in it.** `tools=` is pinned to `Read`,
+`Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `Glob`, `Grep` — the four write tools the matcher
+gates, plus three that cannot mutate the tree. Note that this is `tools=`, not `allowed_tools=`:
+under `bypassPermissions` an `allowed_tools` entry would only pre-approve a tool the session already
+has, whereas `tools=` removes everything unnamed from the session entirely, which is the difference
+between a permission list and a boundary.
+
+`Bash` is excluded because it is an *ungated* write path — `sed -i`, `cat > f`, a formatter, a
+codegen script, a test run that rewrites a fixture — and none of it reaches a `PreToolUse` matcher
+keyed on tool names. Such a write takes no lease and lands in no `file_changes` row, so the veto
+would hold for structured edits and silently not hold for shell ones, which is worse than not holding
+at all: the ledger would under-report what the fleet touched while reading as complete. Gating `Bash`
+instead would mean deciding which paths an arbitrary shell command writes, which is parsing arbitrary
+shell, and being wrong once is exactly the collision this system exists to prevent. `Task` is out for
+the same reason at one remove: a subagent gets its own tool set and would take `Bash` back with it.
+
+The cost is real and is not hidden: **an agent cannot run anything inside a task** — not the tests it
+just wrote, not a linter, not `git`. Tasks have to be expressible as edits, and verification is
+something that happens to the tree afterwards; `codefleet demo` runs the target repository's own
+suite itself, once, after the fleet drains.
+
 Two smaller decisions fall out of this:
 
 - **Matcher, not `if`.** Hooks are registered as
@@ -714,9 +758,11 @@ Two smaller decisions fall out of this:
   matcher with a Python-side tool-name filter. For that pattern the CLI does exact set membership on
   a `|`-split list; the intent is declarative and reviewable in one line.
 - **`setting_sources=[]`.** The SDK default is `None`, which loads the *host user's* `~/.claude`
-  settings, agents, skills, and `CLAUDE.md`. Measured on a developer machine: 16 agents visible with
-  the default versus 5 CLI built-ins with `[]`. A demo that does not pin this behaves differently on
-  every reader's laptop. Note the trap: setting `skills=` silently flips `setting_sources` back to
+  settings, agents, skills, and `CLAUDE.md` — so the tool, agent and skill set in scope is whatever
+  that particular developer happens to have installed, and a demo that does not pin it behaves
+  differently on every reader's laptop. With `[]` the session sees the CLI built-ins and nothing
+  else, and the `init` frame proves which (§6.4). Note the trap: setting `skills=` silently flips
+  `setting_sources` back to
   `["user", "project"]`, so if skills are ever enabled, `setting_sources` must be passed explicitly
   in the same call.
 
@@ -751,28 +797,32 @@ cannot finish without registering its middleware in `api.py`, which T3 holds. T4
 off, and succeeds on retry once T3 releases. The declared scope was a good-faith guess and it was
 wrong; the lease is what made that safe.
 
-The reference had `file_scope` on the task, described it as the basis for conflict handling, and then
-used it only to interpolate a sentence into the prompt (`reference/src/runners/claude_runner.py:173-175`).
-It was never consulted by the scheduler. That is the single largest missed opportunity in the
-original design.
+The point of `file_scope` is that the *scheduler* reads it. A declared scope that only ever reaches
+the agent as a sentence in its prompt is documentation, not coordination: it cannot stop two tasks
+from being started against the same file, and it makes the fleet's behaviour depend on whether a
+model chose to honour a request. Here it is an input to step 3 of the assignment algorithm, and the
+lease is the enforcement behind it.
 
 ### 6.3 Dumb runner, smart server — and how to falsify it
 
 The claim is that runners contain zero coordination logic. Claims like that rot unless something
 enforces them.
 
-**The falsifiable test.** The repo ships a `FakeRunner` that speaks exactly the same HTTP contract as
-the real one — register, heartbeat, poll, start, acquire leases, report — but executes a task by
-writing a scripted file and returning a scripted result instead of running an SDK session. **Every
-coordination test in the suite runs against `FakeRunner`, and passes.** Assignment ordering,
-dependency cascade, stale-agent requeue, lease exclusion under concurrency, veto-and-retry, attempt
-exhaustion, `blocked_upstream` propagation — all of it, with no API key, no network, and no
-`claude_agent_sdk` import.
+**The falsifiable test.** The substitution is one seam wide: the *real* `Runner` takes an `Executor`,
+and `ScriptedExecutor` executes a task by writing a scripted file and returning a scripted result
+instead of running an SDK session. Everything else — register, heartbeat, poll, start, acquire
+leases, report — is the shipping code path, not a re-implementation of it, which is what makes the
+test falsifiable rather than a parallel universe that agrees with itself. **Every coordination test
+in the suite runs that way, and passes.** Assignment ordering, dependency cascade, stale-agent
+requeue, lease exclusion under concurrency, veto-and-retry, attempt exhaustion, `blocked_upstream`
+propagation — all of it, with no API key, no network, and no `claude_agent_sdk` import.
 
-The enforcement is mechanical: a test asserts that no module under `codefleet/` other than
-`codefleet.session` imports `claude_agent_sdk`, and a second asserts that no module under
-`codefleet.runner` writes to the database. If coordination logic ever leaks into the runner, a
-coordination test would have to import the SDK to exercise it, and that test fails.
+The enforcement is mechanical, in `tests/unit/test_boundaries.py`: a test asserts that no module
+under `codefleet/` other than `codefleet.session` imports `claude_agent_sdk`, and a second asserts
+that `codefleet.runner` imports neither `codefleet.store` nor `codefleet.scheduler` — the import ban
+is the checkable form of "holds no coordination logic and cannot reach the database". If coordination
+logic ever leaks into the runner, a coordination test would have to import the SDK to exercise it,
+and that test fails.
 
 The corollary is that the scheduler is a pure function. `schedule(state, now) -> [Decision]` takes a
 frozen snapshot and returns decisions; it cannot read a clock, open a socket, or touch SQLite. Its
@@ -782,8 +832,8 @@ event loop, and no mock database in any scheduler test.
 **Rejected alternative: runners claim their own work.** A runner could `SELECT ... FOR UPDATE`-style
 claim a pending task directly. That is fewer moving parts, but it pushes the priority ordering, the
 dependency join, and the scope-disjointness check into every runner — three copies of the policy that
-must agree — and it makes the "swap in a fake runner" test meaningless, because the fake would have
-to reimplement the scheduler.
+must agree — and it makes the "swap in a scripted executor" test meaningless, because the
+scripted executor would have to reimplement the scheduler.
 
 **Rejected alternative: one Claude session, many subagents.** Using the SDK's `agents` /
 `Task`-spawning to fan out inside a single session is simpler and cheaper. It also makes the
@@ -795,8 +845,8 @@ coordination is externalized and legible.
 
 - **`query()`, not `ClaudeSDKClient`.** `ClaudeSDKClient` offers a cooperative `interrupt()`, which
   is the tidier way to enforce a wall clock. It also requires streaming-input mode and a connect /
-  disconnect lifecycle to get right. `query()` is one call, it is what the feasibility probes proved
-  out, and the session is already bounded on three axes the SDK enforces itself (`max_turns`,
+  disconnect lifecycle to get right. `query()` is one call, it is the path measured to work end to
+  end, and the session is already bounded on three axes the SDK enforces itself (`max_turns`,
   `max_budget_usd`, and the model's own stopping). The wall clock is an `asyncio.wait_for` backstop
   around the generator. Honest cost: on that backstop path a cancellation can skip the SDK's
   terminate/kill escalation and orphan a CLI subprocess, so the runner reaps its child explicitly on
@@ -824,139 +874,34 @@ coordination is externalized and legible.
 
 ---
 
-## 7. What the reference got right, and what it got wrong
+## 7. Decision record
 
-The reference (`reference/`) was built fast. The idea under it is sound; most of what was built on
-top of it did not run. Both halves are worth stating precisely, because the good parts are being
-kept and the bad parts are the specification for what to do differently.
+The questions a design like this has to answer, and how each was answered.
 
-### Right
-
-| Idea | Kept as |
-| --- | --- |
-| Dumb runner / smart orchestrator | The core split, §6.3, now with a falsifiable test |
-| A task is a row in a priority queue with a dependency DAG; runnable when unmet deps are empty; ordered `(priority DESC, created_at ASC)` | §4.1–4.2 verbatim, plus a total ordering and a real per-tick batch |
-| Splitting the declared graph from the remaining-blockers set | Kept as *semantics*, not as two columns — one `task_dependencies` table gives both (§3.2) |
-| `file_scope` on the task as the conflict key | Promoted from prompt text to an actual scheduling input (§4.2 step 3) |
-| Conflict detection as an aggregation over an append-only file-change log | Kept as the ledger (§3.5) — but the *primary* mechanism is now prevention, not detection |
-| Heartbeat liveness with a threshold that is a multiple of the interval, plus automatic requeue | §4.4, widened to cover `running` and to release leases |
-| One typed append-only activity stream with a free-form payload | §3.7, now the SSE cursor as well |
-| Per-task cost/token/duration alongside an estimate | §3.1, now actually populated |
-| Atomic counter increments at the same instant as the status transition | One SQLite transaction instead of a Painless script |
-| `TaskResult` as an explicit runner→coordinator DTO | §3.9, and it is literally the completion request body |
-| A `reset` command, so the demo is re-runnable | Kept, and extended to restore the demo tree |
-| `PostToolUse` hooks as the way to observe what agents touch | Kept — and actually registered |
-
-### Wrong
-
-These are verified findings, not impressions. Each was checked against the source for an alternate
-registration site, a config toggle, or a passing test, and none was found.
-
-**The file-change hook was never registered.** `_make_file_change_hook` is defined at
-`reference/src/runners/claude_runner.py:199-223` and has zero call sites. `_build_options`
-(`:185-193`) constructs `ClaudeAgentOptions` with `model`, `allowed_tools`, `permission_mode`, `cwd`,
-`max_turns` and no `hooks=`. `HookMatcher` is imported at `:22` and never used. There is no
-`.claude/settings.json` supplying file-based hooks instead. So `self._files_changed` is always empty,
-the `report_file_change` loop at `:132-140` never executes, and `codefleet-changes` is empty in every
-run. Everything downstream — the `detect_conflicts` ES|QL tool, the `conflict_detection` workflow,
-the `codefleet-conflicts` index, the "Active Conflicts" dashboard panel — reads a permanently empty
-table. Conflict handling, the headline capability, could not fire. The seeded demo data hides this by
-hand-writing `files_changed` into activity events the runner never produces.
-
-**Conflict records were fiction.** `Conflict` is instantiated only in tests. `IDX_CONFLICTS` appears
-nowhere outside `reference/src/config/constants.py`. The only would-be writer,
-`reference/elastic/workflows/conflict_detection.yaml:29-34`, is written in a DSL the Workflows API
-does not accept and calls a `map_conflicts` filter that exists nowhere in the repo.
-
-**Three of seven workflow files were pseudo-code.** `conflict_detection.yaml`, `task_assignment.yaml`,
-and `agent_completion.yaml` are byte-for-byte copies of illustrative blocks in
-`reference/docs/TECHNICAL_SPEC.md:789-822, 832-868, 876-895` — a section the spec itself disclaims at
-`:825` as "the intent", not real syntax. They use `trigger:`/`action:`/`params:` where the four
-working files use `triggers:`/`type:`/`with:`. The deploy script globs all seven, and a validation
-failure is downgraded to a `logger.warning` while the workflow is still recorded as deployed
-(`reference/elastic/setup/create_workflows.py:122-128, 246-247`).
-
-**Orchestration was not server-side reactive, and on the documented path it never ran at all.** The
-README claims the completion cascade fires from an alert (`reference/README.md:5, 61, 154`). In
-reality the runner POSTs the workflow's `/run` endpoint by hand
-(`reference/src/runners/base.py:390` → `:285-307`), reading the workflow id from a CWD-relative,
-gitignored manifest. Worse: `codefleet setup` never calls `create_workflows` at all
-(`reference/src/cli/main.py:289-293`, docstring at `:286` says otherwise), so following the README
-deploys zero workflows, the manifest never exists, and every completion hits a `logger.debug` early
-return. The auto-assignment and stale-agent workflows are equally undeployed on that path.
-
-**Auto-assignment was one task per 30 seconds for the whole fleet.** See §4.2.
-
-**Token accounting was structurally zero.** `ClaudeRunner.execute_task` reads `total_cost_usd` off
-the `ResultMessage` and never `usage`, so `TaskResult.tokens_used` takes its `int = 0` default at
-`reference/src/models.py:201`. That zero is written into `Task.actual_tokens_used`
-(`reference/src/runners/base.py:342`) and `+=`'d into `Agent.total_tokens_used` (`:358`). Cost worked;
-tokens never moved. Seeded agents made the dashboard look plausible.
-
-**Git worktree isolation was claimed and never built.** `reference/docs/PRD.md:104` says each runner
-gets its own worktree; `PRD.md:152` lists worktree management as future work. There are zero
-`subprocess`/`git` calls anywhere in the tree, `FleetManager` passes the same `self.workdir` to every
-runner (`reference/src/runners/manager.py:91`), and `Agent.worktree_path` is never written. So N
-agents ran `bypassPermissions` sessions in one shared directory with no protection at all — which is
-precisely the situation conflict detection was supposed to cover, and it was disabled.
-
-**Half the vocabulary was dead in one direction and wrong in the other.** Five of ten `EventType`
-members were never emitted (`heartbeat`, `tool_call`, `file_changed`, `conflict_detected`, `error`),
-while three workflows wrote `event_type` values that were not enum members at all
-(`task_assigned`, `task_unblocked`, `stale_agent_recovery`) — the index typed the field as a bare
-keyword, so nothing rejected them. Two `TaskStatus` values (`blocked`, `cancelled`) and two
-`AgentStatus` values (`paused`, `error`) were unreachable. `Agent.capabilities` was documented as the
-basis for assignment, populated in seed data, always `[]` in production, and read by nothing.
-
-**The test suite could not catch any of it.** Both runner test modules are wrapped in
-`try/except ImportError` with a module-level `skipif`, so an import regression turns the suite green
-by skipping. The one test that touches `execute_task` mocks the SDK with an `AsyncMock` that makes
-`async for` raise `TypeError`, which the runner's bare `except Exception` swallows — and then asserts
-`result.success is True or result.success is False`, a tautology. The mock ES client silently drops
-the `script=` kwarg, so the scripted counter increments — the only ES-specific logic in the runner —
-were never exercised. Every test that asserts "file changes were logged" uses a stub runner that
-writes the record itself.
-
-**The repo shipped no target codebase.** `demo-app/` was gitignored along with every demo seed and
-reset script, and `--workdir` defaulted to `.` — so following the quickstart pointed N autonomous
-`bypassPermissions` sessions at CodeFleet's own source tree, driven by a backlog whose `file_scope`
-named files that existed nowhere in the repository. Two of the three quickstart commands crashed
-outright: `codefleet setup` awaited a synchronous function (`TypeError`) and `codefleet seed` called
-`seed.main()` against a module defining `_main()` (`AttributeError`), both wrapped in an
-`except ImportError` that could catch neither.
-
-The pattern across all of it is one thing: **nothing was ever executed end to end.** That is the
-failure this rebuild is organized against, which is why §6.3's falsifiable test and the shipped
-demo target exist.
-
----
-
-## 8. Decisions where the reference was ambiguous or wrong
-
-| # | Question the reference left open | Decision | Reasoning |
+| # | Question | Decision | Reasoning |
 | --- | --- | --- | --- |
-| D1 | Is `blocked_by` stored or derived? | Derived from `task_dependencies`. | The reference stored both and its own seed data disagreed about when they should match. One edge table gives both semantics and removes the drift. |
-| D2 | Is `blocked` a status or a predicate? | A predicate. `blocked_upstream` is a *different* thing and is a real status. | The reference declared `blocked`, never wrote it, and read it. Blocked-by-dependency is derived; blocked-because-an-ancestor-failed is a durable fact needing operator action. |
-| D3 | Are `assigned` and `in_progress` really two states? | Yes, both kept. | They fail differently: `assigned` but never started means the runner died between the decision and the poll; `running` means a session is live and may be wedged. Both are requeued, but the diagnostics differ. |
+| D1 | Is `blocked_by` stored or derived? | Derived from `task_dependencies`. | Storing the graph twice means storing one fact in two shapes that can disagree, and something has to keep them equal on every write. One edge table gives both semantics — declared edges and remaining blockers — and has nothing to drift against. |
+| D2 | Is `blocked` a status or a predicate? | A predicate. `blocked_upstream` is a *different* thing and is a real status. | A status is a durable fact somebody has to act on. Blocked-by-dependency is neither: it is recomputed from the graph on every tick and clears itself when the dependency lands. Blocked-because-an-ancestor-failed is durable and does need operator action, so it earns a status. |
+| D3 | Are `assigned` and `running` really two states? | Yes, both kept. | They fail differently: `assigned` but never started means the runner died between the decision and the poll; `running` means a session is live and may be wedged. Both are requeued, but the diagnostics differ. |
 | D4 | Is assignment separate from claiming? | No. Assignment *is* the claim. | One scheduler, one process, one transaction. Adding a claim step would add a race that does not currently exist. |
-| D5 | Is an agent an identity or a process instance? | An identity, keyed by `name`, with an `epoch` that identifies the instance. | The reference minted a fresh UUID per `register()`, orphaning every lifetime counter on restart. Name-keyed rows make counters meaningful; `epoch` fences the zombie. |
-| D6 | Is `offline` terminal? | No. Heartbeat or re-registration returns an agent to `idle`. | The reference's fleet shrank monotonically and could never grow back. |
-| D7 | Timezone policy? | All datetimes timezone-aware UTC; stored as ISO-8601 `...Z` text; naive datetimes rejected at the model boundary. | The reference used naive `datetime.utcnow()` in models and `Z`-suffixed strings everywhere else, so comparing a seeded task to a fresh one raised `TypeError`. |
+| D5 | Is an agent an identity or a process instance? | An identity, keyed by `name`, with an `epoch` that identifies the instance. | Minting a fresh id per registration orphans every lifetime counter the moment a runner restarts, and restarts are routine. A name-keyed row makes "this slot has succeeded 40 tasks and spent $2" a true statement across the life of the fleet; `epoch` carries the per-instance part, which is what fences the zombie. |
+| D6 | Is `offline` terminal? | No. Heartbeat or re-registration returns an agent to `idle`. | A terminal `offline` makes the fleet shrink monotonically: any runner that misses four beats is gone for good and restarting the process cannot return the capacity. Recovery has to be the same path as arrival. |
+| D7 | Timezone policy? | All datetimes timezone-aware UTC; stored as ISO-8601 `...Z` text; naive datetimes rejected at the model boundary. | Mixing naive `datetime.utcnow()` with `Z`-suffixed strings makes comparing two timestamps a `TypeError` that only appears when a stored row meets a fresh one — late, in production, on the staleness path. One representation, enforced at the boundary, makes the whole class unrepresentable. |
 | D8 | How are file changes observed — hooks or `git diff`? | `PostToolUse` hooks. | In one shared tree with N concurrent agents, `git diff` cannot attribute a change to an agent. Hooks give per-agent, per-tool attribution in real time. Accepted tradeoff: hooks record intent, including edits later reverted. |
-| D9 | Does `FileChange` survive as an entity? | Yes, as a narrow `(task, agent, path, tool, at)` ledger. | Narrow and indexable, and it is the audit trail for "what did this run actually touch". The reference modelled the same information twice — once as a dead typed row and once as an untyped blob inside activity metadata. |
+| D9 | Does `FileChange` survive as an entity? | Yes, as a narrow `(task, agent, path, tool, at)` ledger. | Narrow and indexable, and it is the audit trail for "what did this run actually touch". Recording it once as a typed row — rather than also as an untyped blob inside an event payload — means one place to query and no second copy to keep honest. |
 | D10 | Does `Conflict` persist, or is it a query? | Persists, as immutable rows. No resolution state machine. | The moment of denial is a fact worth keeping; a four-state lifecycle with nothing driving it is not. |
 | D11 | Where does token/cost accounting come from? | `ResultMessage.model_usage`, summed across models; cost from `total_cost_usd`. Per-task totals only, accumulated per agent. | `ResultMessage.usage` is the last API call's usage, not the session's, and per-`AssistantMessage` summing double-counts. |
-| D12 | What is the isolation model? | One shared working tree. No git worktrees, no branches. | The problem being solved is *coordination on one codebase*. Worktrees would convert a write-time collision into a merge-time collision, which is a strictly harder problem and a different project. The reference promised worktrees and shipped a shared tree with no protection; this ships a shared tree with protection. |
-| D13 | What is the concurrency-control story? | One process, one scheduler, SQLite WAL, `BEGIN IMMEDIATE` for the assignment transaction, `busy_timeout` set. Lease exclusion is a PK constraint, not application logic. | The reference had none — two schedulers could have assigned the same task twice, and safety rested on the accident that assignment happened once per tick. |
+| D12 | What is the isolation model? | One shared working tree. No git worktrees, no branches. | The problem being solved is *coordination on one codebase*. Worktrees would convert a write-time collision into a merge-time collision, which is a strictly harder problem and a different project. A shared tree with a write-time veto is the honest version of this shape: N agents really are editing one checkout, and the protection is checked before the write rather than promised in a document. |
+| D13 | What is the concurrency-control story? | One process, one scheduler, SQLite WAL, `BEGIN IMMEDIATE` for the assignment transaction, `busy_timeout` set. Lease exclusion is a PK constraint, not application logic. | Without it, two schedulers could assign the same task twice and safety would rest on the accident that assignment happens once per tick. Making exclusion a primary key means the database enforces it whatever the application believes. |
 | D14 | Do heartbeats emit events? | No. Only state transitions do. | Heartbeats are liveness, not history. Emitting them would flood the table the dashboard, the SSE stream, and the recording all read from. |
-| D15 | Does a failed task strand its dependents? | No. They are explicitly marked `blocked_upstream` with the failing ancestor named. | The reference fired its cascade only on success, so dependents of a failed task sat `pending` forever and the fleet looked healthy while work was stranded. |
+| D15 | Does a failed task strand its dependents? | No. They are explicitly marked `blocked_upstream` with the failing ancestor named. | A cascade that fires only on success leaves dependents of a failed task `pending` forever: never runnable, never reported, and indistinguishable from work that has not started yet. Naming the ancestor turns a silent stall into a diagnosable state that `retry` can undo. |
 | D16 | What happens when the coordination server is unreachable from a hook? | Deny. Fail closed. Task fails `infra`, retryable. | Failing open reintroduces the exact collision the system exists to prevent. |
-| D17 | Is there a planner that decomposes a request into tasks? | Not in v1. Tasks come from `POST /tasks` or a YAML file. | It is a separable concern and it is where the reference spent its complexity budget. The interesting claim here is the coordination, and a planner would sit cleanly on top of the same API later. |
-| D18 | Is the CLI an HTTP client or does it touch the database? | HTTP client, exclusively. | The reference's CLI wrote directly to the store, which is exactly why `reset` and the workflows disagreed about state. One writer, one set of invariants. |
+| D17 | Is there a planner that decomposes a request into tasks? | Not in v1. Tasks come from `POST /tasks` or a YAML file. | It is a separable concern, and it is the part of a system like this that most easily absorbs the entire complexity budget. The interesting claim here is the coordination, and a planner would sit cleanly on top of the same API later. |
+| D18 | Is the CLI an HTTP client or does it touch the database? | HTTP client, exclusively. | A second writer is a second set of invariants. A CLI that writes to the store directly can leave state the server's own rules would never have produced, and the two disagree about what the fleet is doing. One writer, one set of invariants. |
 
 ---
 
-## 9. Non-goals
+## 8. Non-goals
 
 Explicitly out of scope for this repository. Each is a defensible feature; none is needed to
 demonstrate the thing this is about, and several would obscure it.
@@ -975,8 +920,8 @@ demonstrate the thing this is about, and several would obscure it.
   assumes a trusted single-operator context. This is stated in the README rather than half-built.
 - **A web UI.** The dashboard is a terminal client over SSE. The SSE stream is public API, so a web
   UI is a downstream project, not a missing feature.
-- **Semantic search over tasks / duplicate detection.** The reference's embedding surface is cut
-  wholesale (§3.10).
+- **Semantic search over tasks / duplicate detection.** No embeddings, no similarity search over
+  descriptions. Nothing in the coordination path reads them (§3.10).
 - **Session resumption after a crash.** Sessions are per-task and per-attempt; a failed attempt
   starts fresh. Resuming would require persisting the session id at the `init` message and a defined
   resume path, and a fresh attempt against a partially-modified tree is the more predictable
@@ -994,7 +939,7 @@ demonstrate the thing this is about, and several would obscure it.
 
 ---
 
-## 10. Testing contract
+## 9. Testing contract
 
 Stated here because it constrains the design, not because it is an implementation detail.
 
@@ -1002,13 +947,17 @@ Stated here because it constrains the design, not because it is an implementatio
 | --- | --- | --- |
 | Scheduler unit tests | always | nothing. No DB, no event loop, no fixtures. `FleetState` is built literally. |
 | Store + API tests | always | a temp-file SQLite DB and `httpx.ASGITransport`. No network. |
-| Coordination tests | always | `FakeRunner` against the real server. No API key, no `claude_agent_sdk` import. |
+| Coordination tests | always | the real `Runner` with a `ScriptedExecutor`, against the real server. No API key, no `claude_agent_sdk` import. |
 | Live end-to-end | `-m live`, deselected by default | `ANTHROPIC_API_KEY`. Runs the demo graph against `examples/demo-repo` and asserts: the cascade fired, exactly one veto occurred, the vetoed task succeeded on retry, and `demo-repo`'s own test suite still passes. |
+
+The three always-tiers are unconditional. They import nothing optional, so there is no guard that
+could turn the suite green by skipping itself, and a test that asserts a coordination rule asserts
+the real thing rather than the behaviour of a mock standing in for it.
 
 Specific tests the design owes:
 
-- Every `EventType` member is emitted at least once during the fake-runner demo run.
-- N fake runners racing for one path: exactly one `allow`, N−1 `deny`, one lease row.
+- Every `EventType` member is emitted at least once during the scripted demo run.
+- N scripted runners racing for one path: exactly one `allow`, N−1 `deny`, one lease row.
 - A stale agent's leases are released in the same transaction as its task requeue.
 - A vetoed task's `file_scope` contains the denied path afterwards, and the scheduler no longer
   co-schedules it with the holder.

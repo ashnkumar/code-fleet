@@ -20,11 +20,18 @@ silently rather than loudly:
   prevent.
 * The post-write callback never raises. The ledger is observational; a failed
   ledger write must not fail a task that otherwise succeeded.
+* Every other coordination failure is weather. A runner is a long-lived process
+  whose entire job is to stay up, so a 5xx, a reset connection or a momentary
+  timeout is retried with a bounded backoff and logged — never allowed to end a
+  loop silently, which shrinks the fleet with nothing on screen to say so. Only
+  a fault that outlasts the whole retry budget ends the runner, and it ends it
+  loudly.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections.abc import Callable, Sequence
 from contextlib import suppress
@@ -62,6 +69,15 @@ REQUEST_TIMEOUT_S = 10.0
 
 # The ledger is fire-and-forget, so it gets a much shorter leash than a decision.
 LEDGER_TIMEOUT_S = 2.0
+
+# How long a loop waits after each consecutive transport failure, and — by its
+# length — how many it rides out before giving up. Bounded on purpose: the
+# server's stale sweep requeues the work of a runner that stops answering, so
+# retrying costs the fleet nothing, but a runner that can never reach the server
+# again is a fault the operator has to see rather than a slot spinning forever.
+RETRY_BACKOFF_S: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0, 8.0)
+
+logger = logging.getLogger("codefleet.runner")
 
 _DENY_INSTRUCTION = (
     "{path} is held by {holder} for task {task}. Do not retry this file or edit "
@@ -137,6 +153,12 @@ class Runner:
         ]
         try:
             await asyncio.gather(*loops)
+        except Exception as died:
+            # The last place this exception can still be explained: the caller
+            # gathers runners with `return_exceptions=True`, so an unlogged
+            # death here is a fleet that quietly shrank.
+            logger.error("%s: stopping — %s", self.name, _describe(died))
+            raise
         finally:
             for loop in loops:
                 loop.cancel()
@@ -156,30 +178,87 @@ class Runner:
     # -- loops -------------------------------------------------------------
 
     async def _heartbeat_loop(self) -> None:
+        failures = 0
         while not self._stop.is_set():
             try:
-                await self._request("POST", f"/agents/{self.agent_id}/heartbeat", json={})
-            except StaleEpoch as fenced:
-                # This is the one signal that a task was taken away mid-flight.
-                await self._abandon_session()
-                await self._reregister(fenced.epoch)
+                await self._heartbeat_once()
+            except httpx.HTTPError as blip:
+                failures = await self._ride_out("heartbeat", blip, failures)
+                continue
+            failures = 0
             await self._sleep(self.settings.heartbeat_interval)
 
+    async def _heartbeat_once(self) -> None:
+        try:
+            await self._request("POST", f"/agents/{self.agent_id}/heartbeat", json={})
+        except StaleEpoch as fenced:
+            # This is the one signal that a task was taken away mid-flight.
+            await self._abandon_session()
+            await self._reregister(fenced.epoch)
+
     async def _poll_loop(self) -> None:
+        failures = 0
         while not self._stop.is_set():
             try:
-                task = await self._fetch_assignment()
-                if task is None:
-                    await self._sleep(self.settings.poll_interval)
-                    continue
-                await self._execute(task)
-            except StaleEpoch as fenced:
+                await self._poll_once()
+            except httpx.HTTPError as blip:
+                # Anything in flight is abandoned rather than reported late over
+                # the top of whoever the server hands the task to next; the
+                # deadline sweep is what puts the task back on the queue.
                 await self._abandon_session()
-                await self._reregister(fenced.epoch)
-            except AssignmentLost:
-                # The server moved the task on between the poll and the start
-                # call. There is nothing to report and nothing to clean up.
+                failures = await self._ride_out("poll", blip, failures)
+                continue
+            failures = 0
+
+    async def _poll_once(self) -> None:
+        """One pass of the poll loop, fenced but not retried.
+
+        Split out from the loop so that re-registration — which is itself an
+        HTTP call, and the thing most likely to fail while a server is coming
+        back up — sits inside the loop's retry arm rather than beside it.
+        """
+        try:
+            task = await self._fetch_assignment()
+            if task is None:
                 await self._sleep(self.settings.poll_interval)
+                return
+            await self._execute(task)
+        except StaleEpoch as fenced:
+            await self._abandon_session()
+            await self._reregister(fenced.epoch)
+        except AssignmentLost:
+            # The server moved the task on between the poll and the start call.
+            # There is nothing to report and nothing to clean up.
+            await self._sleep(self.settings.poll_interval)
+
+    async def _ride_out(self, where: str, failure: httpx.HTTPError, failures: int) -> int:
+        """Back off after a transient coordination failure, or re-raise having tried.
+
+        Retrying is strictly safer than exiting: the server already requeues the
+        work of a runner that stops answering, so a loop that waits out a blip
+        costs the fleet a few seconds, while a loop that returns costs it a
+        runner for the rest of the run. The budget is what keeps that from
+        becoming a slot that spins forever against a server it will never reach.
+        """
+        if failures >= len(RETRY_BACKOFF_S):
+            logger.error(
+                "%s: %s failed %d times in a row (%s); giving up",
+                self.name,
+                where,
+                failures + 1,
+                _describe(failure),
+            )
+            raise failure
+        delay = RETRY_BACKOFF_S[failures]
+        logger.warning(
+            "%s: %s failed (%s); retrying in %.1fs",
+            self.name,
+            where,
+            _describe(failure),
+            delay,
+        )
+        await self._sleep(delay)
+        return failures + 1
 
     async def _fetch_assignment(self) -> Task | None:
         response = await self._request("GET", f"/agents/{self.agent_id}/assignment")
@@ -214,11 +293,12 @@ class Runner:
             return
 
         failure = session.exception()
-        result = (
-            self._infra_result(failure)
-            if failure is not None
-            else self._result_of(session.result())
-        )
+        if failure is not None:
+            result = self._infra_result(failure)
+        else:
+            outcome = session.result()
+            self._log_session_posture(task, outcome)
+            result = self._result_of(outcome)
         await self._request(
             "POST", f"/tasks/{task.id}/complete", json=result.model_dump(mode="json")
         )
@@ -240,7 +320,17 @@ class Runner:
         body = response.json()
         if body.get("decision") == "allow":
             return _decision(allow=True)
-        return _decision(allow=False, message=_denial_message(body, paths))
+        # The denied path travels with the decision, not just inside the prose.
+        # One tool call can ask for several paths and be refused over any one of
+        # them; the session records `decision.path` as what the task is blocked
+        # on, and the server widens the task's `file_scope` with it on retry.
+        # Falling back to `paths[0]` there would put a file nobody contended
+        # into the scope of the next attempt.
+        return _decision(
+            allow=False,
+            message=_denial_message(body, paths),
+            path=_denied_path(body),
+        )
 
     async def _on_post_write(self, task_id: str, path: str, tool: str) -> None:
         """Record a write that already happened. Must not raise; see module docstring."""
@@ -340,6 +430,41 @@ class Runner:
             stderr_path=self.settings.run_dir / f"{self.name}.stderr.log",
         )
 
+    def _log_session_posture(self, task: Task, outcome: SessionOutcome) -> None:
+        """Report what the session resolved to, and check the one claim we can check.
+
+        The SDK's init frame is the only record of the settings a session really
+        ran under, as opposed to the ones it was asked for — the model an alias
+        resolved to, the permission mode, the tool set, and the directory the
+        agent believes it is working in. That last one is the runner's business:
+        a session whose cwd is not the shared tree writes outside everything the
+        leases coordinate, so a mismatch is a warning rather than a statistic.
+        Without this the frame is captured, carried through `SessionOutcome` and
+        discarded, which is worse than not capturing it.
+        """
+        frame = outcome.init_frame
+        if frame is None:
+            return
+        logger.info(
+            "%s: %s ran model=%s permission_mode=%s tools=%d cwd=%s session=%s",
+            self.name,
+            task.id,
+            frame.get("model"),
+            frame.get("permissionMode"),
+            len(frame.get("tools") or ()),
+            frame.get("cwd"),
+            outcome.session_id,
+        )
+        cwd = frame.get("cwd")
+        if isinstance(cwd, str) and Path(cwd).resolve() != self.workdir:
+            logger.warning(
+                "%s: %s ran in %s, not the shared tree %s — its writes were not coordinated",
+                self.name,
+                task.id,
+                cwd,
+                self.workdir,
+            )
+
     def _result_of(self, outcome: SessionOutcome) -> TaskResult:
         assert self.agent_id is not None
         return TaskResult(
@@ -372,31 +497,57 @@ class Runner:
         )
 
 
+def _describe(failure: BaseException) -> str:
+    """One line an operator can act on. A status code says more than a repr."""
+    if isinstance(failure, httpx.HTTPStatusError):
+        return f"HTTP {failure.response.status_code} from {failure.request.url.path}"
+    return f"{type(failure).__name__}: {failure}"
+
+
 def _denial_message(body: dict[str, Any], paths: Sequence[str]) -> str:
     """Turn a denial into an instruction the model will actually obey.
 
     The server's `message` is a statement of fact; what stops an agent from
     editing around the veto is the instruction appended to it.
     """
-    denied = body.get("denied") or []
+    denied = _denied_entries(body)
     if not denied:
         return str(body.get("message") or f"{paths[0]} is held by another agent. Stop now.")
     first = denied[0]
     return _DENY_INSTRUCTION.format(
-        path=first["path"],
+        path=first.get("path", paths[0]),
         holder=first.get("holder_agent_name", "another agent"),
         task=first.get("holder_task_id", "another task"),
     )
+
+
+def _denied_entries(body: dict[str, Any]) -> list[dict[str, Any]]:
+    """The `denied` list, defended against a body that is not shaped like one."""
+    denied = body.get("denied")
+    if not isinstance(denied, list):
+        return []
+    return [entry for entry in denied if isinstance(entry, dict)]
+
+
+def _denied_path(body: dict[str, Any]) -> str | None:
+    """Which file the server actually refused, when it says so."""
+    for entry in _denied_entries(body):
+        path = entry.get("path")
+        if isinstance(path, str) and path:
+            return path
+    return None
 
 
 # `PreWriteDecision` and `SessionOutcome` live in the one module allowed to
 # import the SDK, so they are constructed through these two helpers rather than
 # imported at module scope — that is what keeps `Runner` constructible, and the
 # whole coordination surface testable, without the SDK.
-def _decision(*, allow: bool, message: str | None = None) -> PreWriteDecision:
+def _decision(
+    *, allow: bool, message: str | None = None, path: str | None = None
+) -> PreWriteDecision:
     from codefleet.session import PreWriteDecision
 
-    return PreWriteDecision(allow=allow, message=message)
+    return PreWriteDecision(allow=allow, message=message, path=path)
 
 
 def _outcome(**fields: Any) -> SessionOutcome:

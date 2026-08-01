@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -47,17 +48,48 @@ pytestmark = [
 RUN_TIMEOUT = 900.0
 RUNNERS = 3
 
+# Two tasks declare different files and both end up needing api.py, so the
+# collision is a genuine race between two live agents rather than a scripted
+# one. It does not fire every time: an agent can finish and release the file
+# before the other asks. Measured over live runs it lands most of the time, so
+# a single run is not a safe assertion and a flaky test is worse than none.
+# Retry the whole run a bounded number of times and fail only if the veto never
+# happens — that is a real regression, and at these odds it is not luck.
+# Everything deterministic is asserted on every attempt.
+VETO_ATTEMPTS = 3
+
+
+def _fresh_workspace(demo_repo: Path, run_dir: Path) -> Path:
+    """Each attempt edits its own pristine copy — a retry must not inherit a half-done tree."""
+    tree = run_dir / "workspace"
+    shutil.copytree(demo_repo, tree, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    return tree
+
 
 async def test_the_demo_run_coordinates_real_agents(
-    tmp_path: Path, workspace: Path, demo_tasks: Path
+    tmp_path: Path, demo_repo: Path, demo_tasks: Path
 ) -> None:
     graph = yaml.safe_load(demo_tasks.read_text(encoding="utf-8"))["tasks"]
-    record = await _run_fleet(tmp_path, workspace, graph)
 
-    _assert_every_task_succeeded(record.tasks)
-    _assert_the_cascade_fired(record.events, graph)
-    _assert_a_write_was_vetoed(record.events, record.tasks)
-    _assert_the_target_suite_still_passes(workspace)
+    for attempt in range(1, VETO_ATTEMPTS + 1):
+        run_dir = tmp_path / f"attempt-{attempt}"
+        tree = _fresh_workspace(demo_repo, run_dir)
+        record = await _run_fleet(run_dir, tree, graph)
+
+        # True of every run, whichever way the race went.
+        _assert_every_task_succeeded(record.tasks)
+        _assert_the_cascade_fired(record.events, graph)
+        _assert_the_target_suite_still_passes(tree)
+
+        if _select(record.events, EventType.LEASE_DENIED):
+            _assert_a_write_was_vetoed(record.events, record.tasks)
+            return
+
+    pytest.fail(
+        f"no write was vetoed in {VETO_ATTEMPTS} consecutive runs. Either the demo graph no "
+        "longer forces two agents onto one file, or the PreToolUse hook is not firing — which "
+        "would mean nothing at all is standing between an agent and a file."
+    )
 
 
 # -- assertions --------------------------------------------------------------

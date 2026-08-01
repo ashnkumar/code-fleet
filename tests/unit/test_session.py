@@ -10,7 +10,11 @@ The one test that needs the network is marked `live` and deselected by default.
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
+import subprocess
+import sys
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -20,10 +24,11 @@ from claude_agent_sdk import HookContext, ResultMessage, SystemMessage
 from codefleet.config import Settings
 from codefleet.models import WRITE_TOOL_MATCHER, ErrorKind, Task
 from codefleet.session import (
+    SESSION_TOOLS,
     PreWriteDecision,
     SessionRecorder,
-    _live_cli_children,
-    _reap_cli_children,
+    _new_transport,
+    _reap_transport_child,
     allow_response,
     build_options,
     build_prompt,
@@ -117,6 +122,9 @@ def test_prompt_without_a_declared_scope_says_so() -> None:
         ({"edits": [{"file_path": "a.py"}, {"file_path": "b.py"}]}, ["a.py", "b.py"]),
         # One lease request per file, however many edits target it.
         ({"file_path": "a.py", "edits": [{"file_path": "a.py"}]}, ["a.py"]),
+        # NotebookEdit is in the veto matcher and spells its target differently.
+        ({"notebook_path": "nb.ipynb", "new_source": "x"}, ["nb.ipynb"]),
+        ({"edits": [{"notebook_path": "nb.ipynb"}]}, ["nb.ipynb"]),
         ({}, []),
         ({"file_path": None}, []),
         ({"edits": "not-a-list"}, []),
@@ -279,9 +287,53 @@ async def test_pre_write_hook_fails_closed_when_coordination_raises(workdir: Pat
     assert recorder.outcome(duration_ms=1).error_kind is ErrorKind.INFRA
 
 
-async def test_a_write_tool_with_no_extractable_path_is_not_a_lease_question(
-    workdir: Path,
-) -> None:
+async def test_a_notebook_edit_asks_for_a_lease_like_any_other_write(workdir: Path) -> None:
+    """NotebookEdit is in the matcher, so its target has to reach the server."""
+    seen: list[tuple[list[str], str]] = []
+
+    async def on_pre_write(paths: list[str], tool: str) -> PreWriteDecision:
+        seen.append((paths, tool))
+        return PreWriteDecision(allow=False, message="held by runner-2")
+
+    recorder = SessionRecorder()
+    hook = make_pre_write_hook(workdir=workdir, on_pre_write=on_pre_write, recorder=recorder)
+
+    response = await hook(
+        {
+            "tool_name": "NotebookEdit",
+            "tool_input": {"notebook_path": "analysis.ipynb", "new_source": "1 + 1"},
+        },
+        None,
+        CONTEXT,
+    )
+
+    assert seen == [(["analysis.ipynb"], "NotebookEdit")]
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert recorder.denied_paths == ["analysis.ipynb"]
+
+
+async def test_a_notebook_edit_outside_the_workdir_is_refused(workdir: Path) -> None:
+    recorder = SessionRecorder()
+    hook = make_pre_write_hook(workdir=workdir, on_pre_write=noop_pre_write, recorder=recorder)
+
+    response = await hook(
+        {"tool_name": "NotebookEdit", "tool_input": {"notebook_path": "/tmp/loot.ipynb"}},
+        None,
+        CONTEXT,
+    )
+
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert recorder.out_of_bounds_paths == ["/tmp/loot.ipynb"]
+
+
+async def test_a_write_tool_with_no_readable_path_is_refused(workdir: Path) -> None:
+    """A gated write whose shape we do not understand is an ungated write.
+
+    The matcher only fires for write tools, so an input this module cannot read
+    a path out of means the extractor has fallen behind a tool schema. Allowing
+    it would put a file change past the lease table unseen — the exact hole a
+    `notebook_path` the extractor did not know about used to open.
+    """
     calls: list[list[str]] = []
 
     async def on_pre_write(paths: list[str], tool: str) -> PreWriteDecision:
@@ -291,10 +343,142 @@ async def test_a_write_tool_with_no_extractable_path_is_not_a_lease_question(
     recorder = SessionRecorder()
     hook = make_pre_write_hook(workdir=workdir, on_pre_write=on_pre_write, recorder=recorder)
 
-    response = await hook({"tool_name": "Write", "tool_input": {}}, None, CONTEXT)
+    response = await hook(
+        {"tool_name": "SomeFutureWriteTool", "tool_input": {"target": "a.py"}}, None, CONTEXT
+    )
 
-    assert response == {}
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert calls == []
+    assert recorder.unreadable_writes == ["SomeFutureWriteTool"]
+    # Loud, and not a lease conflict: nothing to widen the task's file_scope with.
+    outcome = recorder.outcome(duration_ms=1)
+    assert outcome.error_kind is ErrorKind.INFRA
+    assert outcome.blocked_on_path is None
+
+
+@pytest.mark.parametrize(
+    "tool_input",
+    [
+        pytest.param(["linkstash/api.py"], id="list"),
+        pytest.param("linkstash/api.py", id="string"),
+        pytest.param(42, id="number"),
+        pytest.param(None, id="null"),
+        pytest.param({"file_path": {"path": "linkstash/api.py"}}, id="nested-object"),
+        pytest.param({"file_path": ["linkstash/api.py"]}, id="list-valued-path"),
+    ],
+)
+async def test_a_write_whose_input_is_not_shaped_like_one_is_denied_not_raised(
+    workdir: Path, tool_input: object
+) -> None:
+    """`tool_input` is model-shaped JSON, not a validated schema.
+
+    An exception thrown out of the hook is a decision handed to the CLI rather
+    than made here, and there is no shape of input for which that is the answer
+    we want. Anything the extractor cannot read a path out of — including
+    something that is not a mapping at all — comes back as a deny.
+    """
+    calls: list[list[str]] = []
+
+    async def on_pre_write(paths: list[str], tool: str) -> PreWriteDecision:
+        calls.append(paths)
+        return PreWriteDecision(allow=True)
+
+    recorder = SessionRecorder()
+    hook = make_pre_write_hook(workdir=workdir, on_pre_write=on_pre_write, recorder=recorder)
+
+    response = await hook({"tool_name": "Write", "tool_input": tool_input}, None, CONTEXT)
+
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert calls == []
+    assert recorder.unreadable_writes == ["Write"]
+
+
+async def test_a_path_the_filesystem_refuses_to_resolve_is_denied_not_raised(
+    workdir: Path,
+) -> None:
+    """`Path.resolve()` raises on an embedded NUL. A raise is not a veto.
+
+    It would leave the tool call's fate to the CLI rather than to this hook,
+    which is the one thing the veto may never do.
+    """
+    raw = "linkstash/\x00api.py"
+    calls: list[list[str]] = []
+
+    async def on_pre_write(paths: list[str], tool: str) -> PreWriteDecision:
+        calls.append(paths)
+        return PreWriteDecision(allow=True)
+
+    recorder = SessionRecorder()
+    hook = make_pre_write_hook(workdir=workdir, on_pre_write=on_pre_write, recorder=recorder)
+
+    response = await hook({"tool_name": "Write", "tool_input": {"file_path": raw}}, None, CONTEXT)
+
+    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert calls == []
+    assert recorder.out_of_bounds_paths == [raw]
+
+
+async def test_the_post_write_ledger_survives_an_input_it_cannot_read(workdir: Path) -> None:
+    """The ledger hook sees the same hostile shapes and must not raise either.
+
+    It runs after the write, so raising here cannot protect anything — it only
+    turns a recorded change into a failed turn.
+    """
+    logged: list[tuple[str, str]] = []
+
+    async def on_post_write(path: str, tool: str) -> None:
+        logged.append((path, tool))
+
+    recorder = SessionRecorder()
+    hook = make_post_write_hook(workdir=workdir, on_post_write=on_post_write, recorder=recorder)
+
+    assert await hook({"tool_name": "Write", "tool_input": ["a.py"]}, None, CONTEXT) == {}
+    assert (
+        await hook({"tool_name": "Write", "tool_input": {"file_path": "a\x00b"}}, None, CONTEXT)
+        == {}
+    )
+    assert logged == []
+    assert recorder.files_written == []
+
+
+async def test_the_denied_path_is_the_one_coordination_named(workdir: Path) -> None:
+    """One tool call, several paths, and only the second one is held."""
+
+    async def on_pre_write(paths: list[str], tool: str) -> PreWriteDecision:
+        return PreWriteDecision(allow=False, message="held", path="linkstash/store.py")
+
+    recorder = SessionRecorder()
+    hook = make_pre_write_hook(workdir=workdir, on_pre_write=on_pre_write, recorder=recorder)
+
+    await hook(
+        {
+            "tool_name": "MultiEdit",
+            "tool_input": {
+                "edits": [{"file_path": "linkstash/api.py"}, {"file_path": "linkstash/store.py"}]
+            },
+        },
+        None,
+        CONTEXT,
+    )
+
+    assert recorder.denied_paths == ["linkstash/store.py"]
+    assert recorder.outcome(duration_ms=1).blocked_on_path == "linkstash/store.py"
+
+
+async def test_an_unnamed_denial_still_blocks_on_a_real_path(workdir: Path) -> None:
+    """A coordination layer that names no path leaves the first one as the answer."""
+
+    async def on_pre_write(paths: list[str], tool: str) -> PreWriteDecision:
+        return PreWriteDecision(allow=False, message="held")
+
+    recorder = SessionRecorder()
+    hook = make_pre_write_hook(workdir=workdir, on_pre_write=on_pre_write, recorder=recorder)
+
+    await hook(
+        {"tool_name": "Edit", "tool_input": {"file_path": "linkstash/api.py"}}, None, CONTEXT
+    )
+
+    assert recorder.denied_paths == ["linkstash/api.py"]
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +550,31 @@ def test_partial_usage_entries_do_not_break_accounting() -> None:
     usage = {"some-model": {"inputTokens": 12}}
 
     assert sum_model_usage(usage) == (12, 0, 0.0)
+
+
+def test_cached_prompt_tokens_count_as_input_tokens() -> None:
+    """They were read and they were billed; cost_usd already prices them."""
+    usage = {
+        "claude-haiku-4-5": {
+            "inputTokens": 421,
+            "cacheReadInputTokens": 38_112,
+            "cacheCreationInputTokens": 9_004,
+            "outputTokens": 613,
+            "costUSD": 0.0094,
+        }
+    }
+
+    assert sum_model_usage(usage) == (47_537, 613, pytest.approx(0.0094))
+
+
+def test_a_malformed_usage_record_does_not_fail_a_session_that_ran() -> None:
+    """The task already ran and was already paid for; accounting is not a verdict."""
+    usage = {
+        "claude-haiku-4-5": {"inputTokens": "n/a", "outputTokens": 10, "costUSD": None},
+        "claude-sonnet-4-5": "not-a-mapping",
+    }
+
+    assert sum_model_usage(usage) == (0, 10, 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -518,6 +727,56 @@ def test_options_pin_the_posture_the_veto_depends_on(workdir: Path) -> None:
     assert options.max_budget_usd == 0.5
     assert options.max_buffer_size is not None
     assert options.max_buffer_size > 1024 * 1024
+    assert options.tools == list(SESSION_TOOLS)
+
+
+def test_the_session_gets_no_shell() -> None:
+    """Bash is left out of the tool set on purpose, and this is where that is stated.
+
+    The veto is a PreToolUse hook on Write/Edit/MultiEdit/NotebookEdit: it sees a
+    write because the tool input names a file. A shell command names nothing —
+    `sed -i`, a redirect, a formatter, a codegen script — so a file written
+    through Bash takes no lease and never reaches the change ledger, which makes
+    the lease stop being the only way a file changes. Gating it instead would
+    mean parsing arbitrary shell, which is not a boundary worth trusting. If you
+    are here because an agent needs to run the test suite: it cannot, and that
+    is the trade. Change the design, not this list.
+    """
+    assert "Bash" not in SESSION_TOOLS
+    # A subagent would come with its own tool set, Bash included.
+    assert "Task" not in SESSION_TOOLS
+
+
+def test_every_gated_write_tool_is_a_tool_the_session_actually_has() -> None:
+    """The veto matcher and the tool set have to describe the same session."""
+    assert set(WRITE_TOOL_MATCHER.split("|")) <= set(SESSION_TOOLS)
+
+
+# The tools in `SESSION_TOOLS` that cannot mutate the working tree, and so need
+# no lease. Spelled out rather than derived, because the whole point is that
+# adding a tool to the session has to be an explicit claim about which side of
+# the veto it falls on.
+READ_ONLY_SESSION_TOOLS = frozenset({"Read", "Glob", "Grep"})
+
+
+def test_no_tool_in_the_session_writes_without_passing_the_veto() -> None:
+    """The other direction of the test above, and the stronger one.
+
+    The matcher being a subset of the tool set says every gated tool exists. It
+    does not say every tool that can write is gated — and that is the claim the
+    whole design rests on. Adding a tool to `SESSION_TOOLS` without either
+    gating it or declaring it read-only fails here, which is the only moment
+    anyone will think about it.
+    """
+    ungated = set(SESSION_TOOLS) - set(WRITE_TOOL_MATCHER.split("|")) - READ_ONLY_SESSION_TOOLS
+
+    assert not ungated, (
+        f"{', '.join(sorted(ungated))} is in the session's tool set but neither gated by "
+        f"{WRITE_TOOL_MATCHER!r} nor declared read-only. If it can touch the tree it has to "
+        "go in `WriteTool` so the PreToolUse hook sees it; if it cannot, say so by adding it "
+        "to READ_ONLY_SESSION_TOOLS here. A write tool nobody gated takes no lease and lands "
+        "in no ledger, which is the one failure this system exists to prevent."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -536,7 +795,9 @@ async def noop_post_write(path: str, tool: str) -> None:
 async def test_run_session_reports_what_the_stream_produced(
     workdir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def fake_drain(*, prompt: str, options: Any, recorder: SessionRecorder) -> None:
+    async def fake_drain(
+        *, prompt: str, options: Any, recorder: SessionRecorder, transport: Any = None
+    ) -> None:
         assert "Add request logging middleware" in prompt
         recorder.observe(SystemMessage(subtype="init", data={"session_id": "sess_abc"}))
         recorder.record_write("linkstash/middleware.py")
@@ -563,7 +824,9 @@ async def test_run_session_registers_both_hooks_under_the_write_matcher(
 ) -> None:
     captured: dict[str, Any] = {}
 
-    async def fake_drain(*, prompt: str, options: Any, recorder: SessionRecorder) -> None:
+    async def fake_drain(
+        *, prompt: str, options: Any, recorder: SessionRecorder, transport: Any = None
+    ) -> None:
         captured["options"] = options
         recorder.observe(make_result())
 
@@ -585,21 +848,27 @@ async def test_run_session_registers_both_hooks_under_the_write_matcher(
         assert len(matchers[0].hooks) == 1
 
 
-async def test_run_session_times_out_and_reaps(
-    workdir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+async def hang(
+    *, prompt: str, options: Any, recorder: SessionRecorder, transport: Any = None
 ) -> None:
-    async def hang(*, prompt: str, options: Any, recorder: SessionRecorder) -> None:
-        recorder.observe(SystemMessage(subtype="init", data={"session_id": "sess_hung"}))
-        await asyncio.sleep(30)
+    recorder.observe(SystemMessage(subtype="init", data={"session_id": "sess_hung"}))
+    await asyncio.sleep(30)
 
-    reaped: list[frozenset[Any]] = []
 
-    def fake_reap(preexisting: frozenset[Any]) -> list[int]:
-        reaped.append(preexisting)
-        return [4242]
+async def a_sleeping_process() -> asyncio.subprocess.Process:
+    return await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(30)")
+
+
+async def test_run_session_times_out_and_reaps(
+    workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child = await a_sleeping_process()
+
+    class OwnTransport:
+        _process = child
 
     monkeypatch.setattr("codefleet.session._drain", hang)
-    monkeypatch.setattr("codefleet.session._reap_cli_children", fake_reap)
+    monkeypatch.setattr("codefleet.session._new_transport", lambda **_: OwnTransport())
 
     outcome = await run_session(
         task=make_task(),
@@ -612,24 +881,74 @@ async def test_run_session_times_out_and_reaps(
     assert outcome.ok is False
     assert outcome.error_kind is ErrorKind.TIMEOUT
     assert outcome.session_id == "sess_hung"
-    assert len(reaped) == 1
-    assert "4242" in (outcome.error or "")
+    assert str(child.pid) in (outcome.error or "")
+    assert await child.wait() != 0
 
 
-def test_the_reaper_finds_the_sdks_child_registry() -> None:
+async def test_a_timeout_leaves_another_runners_cli_child_alone(
+    workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every runner in this process shares the SDK's one child registry.
+
+    A sibling whose session started after this one is not this one's to kill —
+    reaping by "what appeared since I started" takes down a healthy agent
+    mid-write and reports it as an unexplained infra failure.
+    """
+    from claude_agent_sdk._internal.transport import subprocess_cli
+
+    sibling = await a_sleeping_process()
+
+    async def hang_while_a_sibling_starts(
+        *, prompt: str, options: Any, recorder: SessionRecorder, transport: Any = None
+    ) -> None:
+        subprocess_cli._ACTIVE_CHILDREN.add(sibling)
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr("codefleet.session._drain", hang_while_a_sibling_starts)
+
+    try:
+        outcome = await run_session(
+            task=make_task(),
+            workdir=workdir,
+            settings=Settings(task_timeout=0.05),
+            on_pre_write=noop_pre_write,
+            on_post_write=noop_post_write,
+        )
+
+        assert outcome.error_kind is ErrorKind.TIMEOUT
+        await asyncio.sleep(0.1)
+        assert sibling.returncode is None, "the sibling runner's CLI was killed"
+    finally:
+        subprocess_cli._ACTIVE_CHILDREN.discard(sibling)
+        # Tolerant so a reaper that already killed it fails on the assertion above.
+        with suppress(ProcessLookupError):
+            sibling.kill()
+        await sibling.wait()
+
+
+def test_the_transport_still_hands_us_the_child_the_reaper_kills(workdir: Path) -> None:
     """The reaper reads an SDK private, so assert it is still there.
 
-    With no session running the registry is empty and there is nothing to kill;
-    the point of the test is that a rename in the SDK fails here rather than
-    silently leaking a CLI process on every timeout.
+    An unconnected transport has no child and there is nothing to kill; the
+    point is that a rename in the SDK fails here rather than silently leaking a
+    CLI process on every timeout.
     """
-    assert _reap_cli_children(_live_cli_children()) == []
+    from claude_agent_sdk._internal.transport import subprocess_cli
+
+    options = build_options(workdir=workdir, settings=Settings(), hooks={}, stderr=None)
+    transport = _new_transport(prompt="hello", options=options)
+
+    assert transport._process is None  # type: ignore[attr-defined]
+    assert _reap_transport_child(transport) is None
+    assert isinstance(subprocess_cli._ACTIVE_CHILDREN, set)
 
 
 async def test_run_session_writes_stderr_to_its_own_file(
     workdir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def fake_drain(*, prompt: str, options: Any, recorder: SessionRecorder) -> None:
+    async def fake_drain(
+        *, prompt: str, options: Any, recorder: SessionRecorder, transport: Any = None
+    ) -> None:
         options.stderr("cli said something")
         recorder.observe(make_result())
 
@@ -646,6 +965,62 @@ async def test_run_session_writes_stderr_to_its_own_file(
     )
 
     assert stderr_path.read_text() == "cli said something\n"
+
+
+async def test_a_stderr_line_arriving_after_the_session_ends_is_dropped(
+    workdir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The SDK's stderr reader is detached and outlives a session we timed out.
+
+    It still holds the callback, and the log file it writes to is closed by
+    then; raising there surfaces inside the SDK's own task.
+    """
+    captured: dict[str, Any] = {}
+
+    async def hang_holding_stderr(
+        *, prompt: str, options: Any, recorder: SessionRecorder, transport: Any = None
+    ) -> None:
+        captured["stderr"] = options.stderr
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr("codefleet.session._drain", hang_holding_stderr)
+    stderr_path = tmp_path / "runs" / "runner-1.stderr.log"
+
+    outcome = await run_session(
+        task=make_task(),
+        workdir=workdir,
+        settings=Settings(task_timeout=0.05),
+        on_pre_write=noop_pre_write,
+        on_post_write=noop_post_write,
+        stderr_path=stderr_path,
+    )
+
+    assert outcome.error_kind is ErrorKind.TIMEOUT
+    captured["stderr"]("a line the dying CLI wrote on its way out")
+
+
+# ---------------------------------------------------------------------------
+# Import-time behaviour
+# ---------------------------------------------------------------------------
+
+
+def test_importing_the_module_does_not_rewrite_the_hosts_environment() -> None:
+    """The SDK filters CLAUDECODE and forces CLAUDE_CODE_ENTRYPOINT at spawn time.
+
+    Doing it here as well changed nothing about the child and everything about
+    the parent — `codefleet` shells out to git and pytest after this import.
+    """
+    env = {**os.environ, "CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli"}
+    probe = (
+        "import os, codefleet.session; "
+        "print(os.environ.get('CLAUDECODE'), os.environ.get('CLAUDE_CODE_ENTRYPOINT'))"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe], env=env, capture_output=True, text=True, check=True
+    )
+
+    assert result.stdout.strip() == "1 cli"
 
 
 # ---------------------------------------------------------------------------
