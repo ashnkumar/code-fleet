@@ -3,7 +3,8 @@
 Run several Claude coding agents in parallel against one working tree, and stop the second one
 before it overwrites the first one's file.
 
-<!-- TODO: CI badge — needs the public repo URL. Points at .github/workflows/ci.yml, job `ci`. -->
+<!-- On publish: replace OWNER below (three places in this file) with the GitHub account. -->
+[![ci](https://github.com/OWNER/codefleet/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/codefleet/actions/workflows/ci.yml)
 
 ![Three agents working one repository: T4 is denied a write to api.py because runner-2 holds it for T3, backs off, and succeeds on retry once the file is released.](docs/demo.gif)
 
@@ -47,7 +48,7 @@ exists.
 Needs Python 3.12+, [uv](https://docs.astral.sh/uv/), and an `ANTHROPIC_API_KEY`.
 
 ```bash
-git clone <repo-url> && cd codefleet   # TODO: repo URL
+git clone https://github.com/OWNER/codefleet && cd codefleet
 uv sync
 export ANTHROPIC_API_KEY=sk-ant-...
 uv run codefleet demo
@@ -229,4 +230,4 @@ Real ones, not modesty.
 
 ## License
 
-TODO — licensing is being settled separately. An MIT `LICENSE` is prepared but not committed.
+MIT. See [LICENSE](LICENSE).
