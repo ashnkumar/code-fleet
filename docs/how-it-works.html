@@ -1,0 +1,244 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  :root {
+    --ink: #1c1c1e;
+    --muted: #6b7280;
+    --line: #e5e7eb;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Monaco, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    width: 1560px; height: 616px;
+    font-family: var(--sans);
+    color: var(--ink);
+    background: #fff;
+    padding: 34px 38px 26px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .eyebrow {
+    text-align: center;
+    font-size: 12.5px; font-weight: 700; letter-spacing: .17em;
+    color: #7c8391; text-transform: uppercase; margin-bottom: 20px;
+  }
+  .panels { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px; height: 522px; }
+  .panel { border-radius: 16px; padding: 18px 18px 14px; display: flex; flex-direction: column; }
+  .p1 { background: #f8e6e4; border: 1px solid #e6c4c0; }
+  .p2 { background: #faf0d8; border: 1px solid #e7d6a6; }
+  .p3 { background: #e0eee4; border: 1px solid #b8d6bf; }
+
+  .phead { display: flex; align-items: center; gap: 9px; margin-bottom: 14px; }
+  .num {
+    width: 21px; height: 21px; border-radius: 50%; flex: none;
+    display: grid; place-items: center;
+    font-size: 12px; font-weight: 700; background: #fff;
+  }
+  .p1 .num { color: #a04a42; border: 1.5px solid #d59a92; }
+  .p2 .num { color: #96741d; border: 1.5px solid #d8bd6c; }
+  .p3 .num { color: #38774a; border: 1.5px solid #93bfa0; }
+  .ptitle { font-size: 17.5px; font-weight: 700; letter-spacing: -.015em; }
+  .p1 .ptitle { color: #86372f; } .p2 .ptitle { color: #7d6414; } .p3 .ptitle { color: #2c6640; }
+
+  .card {
+    background: #fff; border: 1px solid #e8e8ea; border-radius: 11px;
+    padding: 13px 14px; box-shadow: 0 1px 2px rgba(16,20,30,.05);
+  }
+  .card + .card { margin-top: 11px; }
+  .clabel {
+    font-size: 10px; font-weight: 700; letter-spacing: .11em; text-transform: uppercase;
+    color: #98a0ad; margin-bottom: 10px;
+  }
+  .foot { margin-top: auto; padding-top: 13px; font-size: 12.5px; line-height: 1.45; text-align: center; }
+  .p1 .foot { color: #8b5a54; } .p2 .foot { color: #806c33; } .p3 .foot { color: #4a7359; }
+  code, .m { font-family: var(--mono); }
+
+  /* ---- panel 1: task graph ---- */
+  .task { display: grid; grid-template-columns: 30px 1fr; gap: 9px; align-items: start; }
+  .task + .task { margin-top: 9px; padding-top: 9px; border-top: 1px solid #f1f1f3; }
+  .chip {
+    font-family: var(--mono); font-size: 11px; font-weight: 700; color: #fff;
+    background: #5b5fc7; border-radius: 5px; padding: 3px 0; text-align: center;
+  }
+  .chip.dep { background: #d98324; }
+  .tname { font-size: 12.8px; line-height: 1.35; font-weight: 500; }
+  .tmeta { font-family: var(--mono); font-size: 10.8px; color: #8b93a1; margin-top: 3px; }
+  .arrow { color: #d98324; font-weight: 700; }
+  .note {
+    margin-top: 11px; background: #fdf6f5; border: 1px dashed #dfb3ad; border-radius: 9px;
+    padding: 10px 12px; font-size: 12px; line-height: 1.5; color: #7a4a44;
+  }
+
+  /* ---- panel 2: runners + timeline ---- */
+  .runners { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 9px; }
+  .runner {
+    background: #fff; border: 1px solid #e2d3a4; border-radius: 10px;
+    padding: 9px 6px; text-align: center;
+  }
+  .rname { font-family: var(--mono); font-size: 11.5px; font-weight: 600; color: #3f4552; }
+  .rtask {
+    display: inline-block; margin-top: 6px; font-family: var(--mono); font-size: 11px;
+    font-weight: 700; color: #fff; background: #5b5fc7; border-radius: 5px; padding: 2px 9px;
+  }
+  .server {
+    margin-top: 11px; background: #fff; border: 1px solid #e2d3a4; border-radius: 11px;
+    padding: 12px 14px; text-align: center;
+  }
+  .stitle { font-size: 13.5px; font-weight: 700; color: #3f4552; }
+  .ssub { font-family: var(--mono); font-size: 11px; color: #8b93a1; margin-top: 5px; }
+  .tl { display: grid; grid-template-columns: 40px 9px 1fr; gap: 8px; align-items: start; }
+  .tl + .tl { margin-top: 9px; }
+  .tt { font-family: var(--mono); font-size: 11px; color: #98a0ad; padding-top: 1px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; margin-top: 5px; background: #5b5fc7; }
+  .dot.o { background: #d98324; } .dot.k { background: #3f4552; }
+  .te { font-size: 12.2px; line-height: 1.4; }
+
+  /* ---- panel 3: veto ---- */
+  .hold {
+    display: flex; align-items: center; justify-content: space-between;
+    background: #f4faf5; border: 1px solid #cfe4d5; border-radius: 9px; padding: 9px 12px;
+    font-size: 12.3px;
+  }
+  .hold + .hold { margin-top: 8px; }
+  .hold.want { background: #fdf5f4; border-color: #eecac5; }
+  .badge {
+    font-family: var(--mono); font-size: 10.5px; font-weight: 700; letter-spacing: .04em;
+    border-radius: 5px; padding: 3px 8px;
+  }
+  .badge.g { background: #e2f0e6; color: #2f6b43; }
+  .badge.r { background: #fbe4e1; color: #b03a2c; }
+  .flow { text-align: center; font-family: var(--mono); font-size: 11.5px; color: #8b93a1; margin: 10px 0 2px; }
+  .deny {
+    background: #fdf0ee; border: 1.5px solid #e8a79e; border-radius: 10px;
+    padding: 11px 13px; text-align: center;
+  }
+  .dtitle { font-size: 15px; font-weight: 800; color: #b03a2c; letter-spacing: .02em; }
+  .dcode { font-family: var(--mono); font-size: 11.2px; color: #96473a; margin-top: 6px; line-height: 1.55; }
+  .after { display: grid; grid-template-columns: 14px 1fr; gap: 9px; align-items: start; font-size: 12.2px; line-height: 1.4; }
+  .after + .after { margin-top: 9px; }
+  .tick { color: #3f8b57; font-weight: 700; }
+</style>
+
+<div class="eyebrow">How CodeFleet works</div>
+
+<div class="panels">
+
+  <!-- ================= 1 ================= -->
+  <div class="panel p1">
+    <div class="phead"><div class="num">1</div><div class="ptitle">Declare the work</div></div>
+
+    <div class="card">
+      <div class="clabel">Task graph &nbsp;·&nbsp; 5 tasks</div>
+
+      <div class="task">
+        <div class="chip">T1</div>
+        <div><div class="tname">Replace config constants with a Settings dataclass</div>
+        <div class="tmeta">linkstash/config.py</div></div>
+      </div>
+      <div class="task">
+        <div class="chip dep">T2</div>
+        <div><div class="tname">Load settings from environment variables</div>
+        <div class="tmeta"><span class="arrow">needs T1</span> &nbsp;·&nbsp; linkstash/config.py</div></div>
+      </div>
+      <div class="task">
+        <div class="chip">T3</div>
+        <div><div class="tname">Add health and stats routes to the dispatcher</div>
+        <div class="tmeta">linkstash/api.py</div></div>
+      </div>
+      <div class="task">
+        <div class="chip">T4</div>
+        <div><div class="tname">Add request logging middleware and enable it</div>
+        <div class="tmeta">linkstash/middleware.py</div></div>
+      </div>
+      <div class="task">
+        <div class="chip dep">T5</div>
+        <div><div class="tname">Test the health route</div>
+        <div class="tmeta"><span class="arrow">needs T3</span> &nbsp;·&nbsp; tests/test_api.py</div></div>
+      </div>
+    </div>
+
+    <div class="note">
+      <b>T3 and T4 declare different files</b>, so the scheduler will run them at the same time —
+      correctly, by its own rules. Declared scope is a guess someone wrote before the agent read
+      the code.
+    </div>
+
+    <div class="foot">Written as YAML, or posted to <span class="m">/tasks</span></div>
+  </div>
+
+  <!-- ================= 2 ================= -->
+  <div class="panel p2">
+    <div class="phead"><div class="num">2</div><div class="ptitle">The fleet runs</div></div>
+
+    <div class="runners">
+      <div class="runner"><div class="rname">runner-1</div><div class="rtask">T1</div></div>
+      <div class="runner"><div class="rname">runner-2</div><div class="rtask">T3</div></div>
+      <div class="runner"><div class="rname">runner-3</div><div class="rtask">T4</div></div>
+    </div>
+
+    <div class="server">
+      <div class="stitle">Coordination server</div>
+      <div class="ssub">schedule(state, now) &rarr; [Decision]</div>
+      <div class="ssub" style="color:#a8afba">assigns · cascades · fences · leases</div>
+    </div>
+
+    <div class="card" style="margin-top:11px">
+      <div class="clabel">One run, start to drain</div>
+      <div class="tl"><div class="tt">0:00</div><div class="dot"></div>
+        <div class="te">T1, T3, T4 assigned — nothing blocks them</div></div>
+      <div class="tl"><div class="tt">0:31</div><div class="dot o"></div>
+        <div class="te">T1 done &rarr; <b>T2 unblocked</b> &rarr; runner-1 picks it up</div></div>
+      <div class="tl"><div class="tt">0:44</div><div class="dot o"></div>
+        <div class="te">T3 done &rarr; <b>T5 unblocked</b> &rarr; runner-2 picks it up</div></div>
+      <div class="tl"><div class="tt">0:52</div><div class="dot k"></div>
+        <div class="te">All 5 complete. The fleet drains.</div></div>
+    </div>
+
+    <div class="note" style="background:#fefaf0;border-color:#ddc783;color:#7a6321">
+      <b>The scheduler is a pure function.</b> It cannot read a clock, open a socket, or touch the
+      database — it takes a frozen snapshot and returns what should happen. The server applies it.
+    </div>
+
+    <div class="foot">
+      Runners decide nothing. They register, heartbeat,<br>poll for an assignment, run one session, report.
+    </div>
+  </div>
+
+  <!-- ================= 3 ================= -->
+  <div class="panel p3">
+    <div class="phead"><div class="num">3</div><div class="ptitle">A collision is vetoed</div></div>
+
+    <div class="card">
+      <div class="clabel">Both agents need one file</div>
+      <div class="hold">
+        <span><b>runner-2</b> holds <span class="m">api.py</span></span>
+        <span class="badge g">LEASED</span>
+      </div>
+      <div class="hold want">
+        <span><b>runner-3</b> tries <span class="m">Edit api.py</span></span>
+        <span class="badge r">WANTS</span>
+      </div>
+      <div class="flow">PreToolUse hook &nbsp;&rarr;&nbsp; POST /leases/acquire</div>
+    </div>
+
+    <div class="card" style="padding:12px">
+      <div class="deny">
+        <div class="dtitle">&#10006; &nbsp;WRITE VETOED</div>
+        <div class="dcode">permissionDecision: "deny"<br>linkstash/api.py held by runner-2</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="clabel">What happens next</div>
+      <div class="after"><div class="tick">&#8594;</div>
+        <div>The agent is told who holds the file and stops cleanly.</div></div>
+      <div class="after"><div class="tick">&#8594;</div>
+        <div>T4 is requeued with <span class="m">api.py</span> folded into its scope.</div></div>
+      <div class="after"><div class="tick">&#10003;</div>
+        <div>The scheduler runs it <b>after</b> T3 releases the file. It succeeds.</div></div>
+    </div>
+
+    <div class="foot"><b>The write never reached the filesystem.</b><br>Prevention, not detection.</div>
+  </div>
+
+</div>

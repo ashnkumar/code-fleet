@@ -1,0 +1,7 @@
+# The HTML under docs/ is diagram source, rendered to PNG for the README. It is
+# documentation, not application code, and counting it skews the language bar.
+docs/*.html linguist-documentation
+
+# The demo target codebase is fixture material the fleet edits during a run. It
+# is not part of the package and should not be read as such.
+examples/demo-repo/** linguist-vendored

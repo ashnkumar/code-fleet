@@ -1,0 +1,206 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  :root {
+    --ink: #1c1c1e;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Monaco, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    --grey-b: #dcdfe4; --grey-f: #eef0f2;
+    --blue-b: #9cc4d8; --blue-f: #dff0f7; --blue-d: #2d6c8a;
+    --green-b: #a8cdb2; --green-f: #e2f0e6; --green-d: #2f6b43;
+    --purp-b: #c3aede; --purp-f: #eee7f9; --purp-d: #5b3f8c;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    width: 1560px; height: 800px;
+    font-family: var(--sans); color: var(--ink); background: #fff;
+    padding: 30px 40px 22px; -webkit-font-smoothing: antialiased;
+  }
+  .row { display: grid; grid-template-columns: 104px 1fr; gap: 14px; align-items: center; }
+  .gutter {
+    font-size: 12px; font-weight: 700; line-height: 1.3; text-align: right;
+    color: #8b93a1; letter-spacing: .01em;
+  }
+  .band { border-radius: 14px; padding: 14px 16px 15px; }
+  .band.grey  { background: var(--grey-f);  border: 1.5px solid var(--grey-b); }
+  .band.blue  { background: var(--blue-f);  border: 1.5px solid var(--blue-b); }
+  .band.purp  { background: var(--purp-f);  border: 1.5px solid var(--purp-b); }
+  .band.tree  { background: #f6f7f8; border: 1.5px solid #d3d7dd; }
+
+  .btitle { display: flex; align-items: center; gap: 8px; margin-bottom: 11px; }
+  .num {
+    width: 20px; height: 20px; border-radius: 50%; flex: none; background: #fff;
+    display: grid; place-items: center; font-size: 11.5px; font-weight: 700;
+  }
+  .n-g { color: #6a7280; border: 1.5px solid #c3c8d0; }
+  .n-b { color: var(--blue-d); border: 1.5px solid var(--blue-b); }
+  .n-gr{ color: var(--green-d); border: 1.5px solid var(--green-b); }
+  .n-p { color: var(--purp-d); border: 1.5px solid var(--purp-b); }
+  .bt { font-size: 15.5px; font-weight: 700; letter-spacing: -.01em; }
+  .bt small { font-weight: 500; font-size: 12.5px; color: #7b838f; margin-left: 7px; letter-spacing: 0; }
+
+  .card { background: #fff; border: 1px solid #e3e6ea; border-radius: 10px; padding: 11px 13px; }
+  .clabel {
+    font-size: 9.5px; font-weight: 700; letter-spacing: .11em; text-transform: uppercase;
+    color: #9aa2af; margin-bottom: 8px;
+  }
+  .m { font-family: var(--mono); }
+  .pill {
+    display: inline-block; font-family: var(--mono); font-size: 11.5px;
+    background: #f2f4f7; border: 1px solid #e2e6ec; border-radius: 6px;
+    padding: 4px 9px; margin: 0 5px 5px 0; color: #3f4552;
+  }
+  .pill.hot { background: #fdeeeb; border-color: #f0bdb3; color: #b03a2c; font-weight: 700; }
+
+  /* connectors */
+  .conn { display: grid; grid-template-columns: 104px 1fr; gap: 14px; }
+  .legs { display: flex; justify-content: space-between; padding: 0 60px; }
+  .leg { display: flex; align-items: center; gap: 9px; font-size: 12.5px; color: #6b7280; }
+  .leg .m { font-size: 11.5px; }
+  .glyph { font-size: 17px; line-height: 1; color: #98a0ad; }
+  .h9 { height: 26px; }
+
+  .cols2 { display: grid; grid-template-columns: 1.15fr 1fr; gap: 12px; }
+  .cols3 { display: grid; grid-template-columns: 1fr 1fr 1fr 0.62fr; gap: 11px; }
+  .runner {
+    background: #fff; border: 1px solid #d6c6ee; border-radius: 10px; padding: 10px 10px 11px; text-align: center;
+  }
+  .runner.ghost { background: transparent; border-style: dashed; border-color: #c0aade; display: grid; place-items: center; color: #7c68a6; font-size: 12.5px; }
+  .rname { font-family: var(--mono); font-size: 12.5px; font-weight: 700; color: #3f4552; }
+  .rsub { font-size: 11px; color: #8b93a1; margin-top: 3px; }
+  .sdk {
+    margin-top: 8px; background: #f7f3fd; border: 1px solid #ddd0f2; border-radius: 7px;
+    padding: 7px 6px; font-size: 11.2px; color: #5b3f8c; line-height: 1.35;
+    display: flex; align-items: center; justify-content: center; gap: 7px;
+  }
+  .mini {
+    width: 16px; height: 16px; border-radius: 50%; flex: none; background: #fff;
+    border: 1.3px solid var(--purp-b); color: var(--purp-d);
+    display: grid; place-items: center; font-size: 10px; font-weight: 700;
+  }
+  .hook {
+    margin-top: 6px; background: #fdeeeb; border: 1px solid #f0bdb3; border-radius: 7px;
+    padding: 6px; font-family: var(--mono); font-size: 10px; color: #b03a2c; line-height: 1.35;
+  }
+  .verdict { display: flex; gap: 12px; justify-content: center; margin-top: 12px; }
+  .v {
+    display: flex; align-items: center; gap: 8px; border-radius: 9px;
+    padding: 8px 14px; font-size: 12.8px; font-weight: 600;
+  }
+  .v.ok { background: #e4f2e8; border: 1.5px solid #a8cdb2; color: #2f6b43; }
+  .v.no { background: #fbe6e2; border: 1.5px solid #eeb0a5; color: #b03a2c; }
+
+  .legend { display: flex; gap: 22px; justify-content: center; margin-top: 15px; font-size: 12px; color: #7b838f; }
+  .sw { display: inline-block; width: 13px; height: 13px; border-radius: 3.5px; margin-right: 7px; vertical-align: -2px; }
+</style>
+
+<!-- ============ CLI ============ -->
+<div class="row">
+  <div class="gutter">You</div>
+  <div class="band grey">
+    <div class="btitle"><div class="num n-g">1</div>
+      <div class="bt">Command line<small>the only interface — no chat UI, no web console</small></div></div>
+    <div>
+      <span class="pill">codefleet demo</span><span class="pill">codefleet serve</span><span class="pill">codefleet load graph.yaml</span><span class="pill">codefleet run --runners 3</span><span class="pill">codefleet watch</span><span class="pill">codefleet tasks --json</span><span class="pill">codefleet doctor</span>
+    </div>
+  </div>
+</div>
+
+<div class="conn"><div></div><div class="legs h9">
+  <div class="leg"><span class="glyph">&#9660;</span> HTTP over <span class="m">127.0.0.1</span></div>
+  <div class="leg"><span class="glyph">&#9650;</span> <span class="m">GET /events/stream</span> — live dashboard over SSE</div>
+</div></div>
+
+<!-- ============ SERVER ============ -->
+<div class="row">
+  <div class="gutter">Coordination<br>server<br><span style="font-weight:500;color:#a8afba">one process</span></div>
+  <div class="band blue">
+    <div class="btitle"><div class="num n-b">2</div>
+      <div class="bt">FastAPI surface<small>every coordination decision is made here, and only here</small></div></div>
+
+    <div class="card">
+      <div class="clabel">What runners call</div>
+      <span class="pill">POST /agents/register</span><span class="pill">POST /agents/{id}/heartbeat</span><span class="pill">GET /agents/{id}/assignment</span><span class="pill">POST /tasks/{id}/start</span><span class="pill hot">POST /leases/acquire</span><span class="pill">POST /changes</span><span class="pill">POST /tasks/{id}/complete</span>
+    </div>
+
+    <div class="cols2" style="margin-top:12px">
+      <div class="card">
+        <div class="btitle" style="margin-bottom:9px"><div class="num n-b">3</div>
+          <div class="bt" style="font-size:14px">Scheduler &amp; engine</div></div>
+        <div class="m" style="font-size:12.5px;color:#2d6c8a;font-weight:600">schedule(state, now) &rarr; [Decision]</div>
+        <div style="font-size:12px;line-height:1.5;color:#5c6470;margin-top:7px">
+          A <b>pure function</b> — it cannot read a clock, open a socket, or touch the database.
+          The engine's tick loop applies the decisions it returns: assign, cascade, fence, expire.
+        </div>
+      </div>
+      <div class="card" style="background:var(--green-f);border-color:var(--green-b)">
+        <div class="btitle" style="margin-bottom:9px"><div class="num n-gr">4</div>
+          <div class="bt" style="font-size:14px">SQLite <small style="margin-left:5px">WAL · one file</small></div></div>
+        <div>
+          <span class="pill">tasks</span><span class="pill">task_dependencies</span><span class="pill">agents</span><span class="pill hot">file_leases</span><span class="pill">file_changes</span><span class="pill">events</span>
+        </div>
+        <div style="font-size:11.5px;line-height:1.45;color:#5c6470;margin-top:2px">
+          Lease exclusion is a primary-key constraint, not application logic.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="conn"><div></div><div class="legs h9">
+  <div class="leg"><span class="glyph">&#9660;</span> assignment, handed out on poll</div>
+  <div class="leg"><span class="glyph">&#9650;</span> heartbeat · start · file changes · result</div>
+</div></div>
+
+<!-- ============ RUNNERS ============ -->
+<div class="row">
+  <div class="gutter">Local<br>execution</div>
+  <div class="band purp">
+    <div class="btitle"><div class="num n-p">5</div>
+      <div class="bt">Runners<small>thin by design: register, heartbeat, poll, run one session, report</small></div></div>
+
+    <div class="cols3">
+      <div class="runner">
+        <div class="rname">runner-1</div><div class="rsub">one task at a time</div>
+        <div class="sdk"><span class="mini">6</span>Claude Agent SDK session</div>
+        <div class="hook">PreToolUse hook<br>Write|Edit|MultiEdit|NotebookEdit</div>
+      </div>
+      <div class="runner">
+        <div class="rname">runner-2</div><div class="rsub">one task at a time</div>
+        <div class="sdk"><span class="mini">6</span>Claude Agent SDK session</div>
+        <div class="hook">PreToolUse hook<br>Write|Edit|MultiEdit|NotebookEdit</div>
+      </div>
+      <div class="runner">
+        <div class="rname">runner-3</div><div class="rsub">one task at a time</div>
+        <div class="sdk"><span class="mini">6</span>Claude Agent SDK session</div>
+        <div class="hook">PreToolUse hook<br>Write|Edit|MultiEdit|NotebookEdit</div>
+      </div>
+      <div class="runner ghost">… up to N</div>
+    </div>
+
+    <div class="verdict">
+      <div class="v ok">&#10003; &nbsp;lease granted &nbsp;<span class="m" style="font-weight:500">&rarr; the write proceeds</span></div>
+      <div class="v no">&#10006; &nbsp;held by another agent &nbsp;<span class="m" style="font-weight:500">&rarr; the write never happens</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="conn"><div></div><div class="legs h9" style="justify-content:center">
+  <div class="leg"><span class="glyph">&#9660;</span> only writes the server allowed</div>
+</div></div>
+
+<!-- ============ TREE ============ -->
+<div class="row">
+  <div class="gutter">Your code</div>
+  <div class="band tree" style="padding:13px 16px">
+    <div class="btitle" style="margin-bottom:0"><div class="num n-g">7</div>
+      <div class="bt">One shared working tree<small>no worktrees, no branch per task, no commits — the fleet edits files, you keep the diff</small></div></div>
+  </div>
+</div>
+
+<div class="legend">
+  <span><i class="sw" style="background:var(--grey-f);border:1.5px solid var(--grey-b)"></i>You &amp; your code</span>
+  <span><i class="sw" style="background:var(--blue-f);border:1.5px solid var(--blue-b)"></i>Coordination — every decision</span>
+  <span><i class="sw" style="background:var(--green-f);border:1.5px solid var(--green-b)"></i>State</span>
+  <span><i class="sw" style="background:var(--purp-f);border:1.5px solid var(--purp-b)"></i>Local execution — the agents</span>
+</div>
