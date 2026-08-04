@@ -580,12 +580,21 @@ def build_options(
     `bypassPermissions` an `allowed_tools` entry would only pre-approve, while
     this removes everything not named from the session entirely. See
     `SESSION_TOOLS` for why the list is what it is.
+
+    `strict_mcp_config=True` closes the gap `setting_sources=[]` leaves open.
+    That one gates settings *files*; MCP configuration loads on its own path, so
+    without this a target repository carrying a `.mcp.json` would hand the
+    session tools nobody here chose. Those tools are outside `SESSION_TOOLS`,
+    they do not match `WRITE_TOOL_MATCHER`, and under `bypassPermissions` they
+    are approved without being asked about — a write path with no lease behind
+    it, which is the same hole `Bash` is excluded to avoid.
     """
     return ClaudeAgentOptions(
         model=settings.model,
         cwd=str(workdir),
         permission_mode="bypassPermissions",
         setting_sources=[],
+        strict_mcp_config=True,
         tools=list(SESSION_TOOLS),
         max_turns=settings.max_turns,
         max_budget_usd=settings.task_budget_usd,

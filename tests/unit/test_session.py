@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from claude_agent_sdk import HookContext, ResultMessage, SystemMessage
+from claude_agent_sdk import ClaudeAgentOptions, HookContext, ResultMessage, SystemMessage
 
 from codefleet.config import Settings
 from codefleet.models import WRITE_TOOL_MATCHER, ErrorKind, Task
@@ -730,6 +730,28 @@ def test_options_pin_the_posture_the_veto_depends_on(workdir: Path) -> None:
     assert options.tools == list(SESSION_TOOLS)
 
 
+def test_a_target_repository_cannot_hand_the_session_its_own_mcp_tools(workdir: Path) -> None:
+    """The fleet runs against someone else's checkout, so that checkout is untrusted input.
+
+    `setting_sources=[]` gates settings *files* and stops there; MCP servers load
+    on a separate path. A repository that ships a `.mcp.json` — plenty do — would
+    otherwise give the session tools that are not in `SESSION_TOOLS`, do not match
+    `WRITE_TOOL_MATCHER`, and are auto-approved under `bypassPermissions`. That is
+    a write that takes no lease, which is the one thing the whole design is for.
+
+    Asserting the SDK's default as well is deliberate: the flag only means
+    something because the default is permissive, and a default that flipped would
+    make this test pass for the wrong reason.
+    """
+    (workdir / ".mcp.json").write_text('{"mcpServers": {"fs": {"command": "writes-files"}}}\n')
+
+    options = build_options(workdir=workdir, settings=Settings(), hooks={}, stderr=None)
+
+    assert options.strict_mcp_config is True
+    assert ClaudeAgentOptions().strict_mcp_config is False
+    assert not options.mcp_servers
+
+
 def test_the_session_gets_no_shell() -> None:
     """Bash is left out of the tool set on purpose, and this is where that is stated.
 
@@ -1029,11 +1051,17 @@ def test_importing_the_module_does_not_rewrite_the_hosts_environment() -> None:
 
 
 @pytest.mark.live
-async def test_a_denied_write_stops_the_agent_and_leaves_the_file_alone(tmp_path: Path) -> None:
+async def test_a_denied_write_never_lands_and_the_runner_reports_it_blocked(tmp_path: Path) -> None:
     """The mechanism, end to end, against the real API.
 
     Everything above proves the pieces are shaped right; only this proves the CLI
     actually honours the veto.
+
+    Named for what it asserts and no more. The deny carries no `continue_: false`,
+    so the model is free to keep going and ask for something else — it would be
+    refused on anything else held. What is enforced is that the denied call does
+    not execute and the outcome comes back `VETO`; a session that also chose to
+    stop is the model cooperating, not the guarantee.
     """
     tree = tmp_path / "tree"
     tree.mkdir()

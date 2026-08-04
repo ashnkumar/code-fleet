@@ -751,7 +751,7 @@ just wrote, not a linter, not `git`. Tasks have to be expressible as edits, and 
 something that happens to the tree afterwards; `codefleet demo` runs the target repository's own
 suite itself, once, after the fleet drains.
 
-Two smaller decisions fall out of this:
+Three smaller decisions fall out of this:
 
 - **Matcher, not `if`.** Hooks are registered as
   `HookMatcher(matcher="Write|Edit|MultiEdit|NotebookEdit", hooks=[...])` rather than a match-all
@@ -765,6 +765,14 @@ Two smaller decisions fall out of this:
   `setting_sources` back to
   `["user", "project"]`, so if skills are ever enabled, `setting_sources` must be passed explicitly
   in the same call.
+- **`strict_mcp_config=True`.** `setting_sources=[]` gates settings *files* and nothing more; MCP
+  servers load on their own path, and the SDK's default is to take every one it can find. The
+  workdir is someone else's checkout — untrusted input by construction — so a `.mcp.json` sitting in
+  it would put tools in the session that are not in `tools=`, do not match the write matcher, and are
+  approved without being asked about, because `bypassPermissions` is what asks. That is an ungated
+  write path arriving through the target repository, which is the `Bash` hole again with a config
+  file instead of a shell. `tests/unit/test_session.py` plants a `.mcp.json` in the fixture tree and
+  pins both this flag and the SDK default it overrides.
 
 ### 6.2 Lazy per-file leases, not pre-declared scope locks
 
