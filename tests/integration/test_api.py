@@ -599,10 +599,24 @@ async def test_the_deadline_sweep_fences_the_agent_it_took_the_task_from(
     `lease_grace_s` is a fixed 60 s backstop on top of `task_timeout`, so a
     negative timeout is the only way to reach the sweep inside a test. What runs
     is the production path unchanged: bump the epoch, park the agent, requeue.
+
+    The hand-out is observed on the task rather than through the agent's own
+    poll, and that is load-bearing rather than stylistic. A negative timeout
+    makes T1 overdue the instant it is assigned, so the sweep may fence this
+    runner before its next poll returns — `assignment()` would then get a 409
+    `stale_epoch` and the test would fail in its setup instead of on the
+    ordering it exists to check. `attempts` counts transitions into `assigned`
+    and is deliberately not reset by the requeue (see `engine`), so it is the
+    durable record that the task was handed out, whichever side of the race the
+    read lands on.
     """
     runner = await register(client, "runner-1")
     await create_tasks(client, task_spec("T1", priority=5), task_spec("T2"))
-    assert (await runner.await_assignment())["id"] == "T1"
+
+    async def t1_was_handed_out() -> bool | None:
+        return (await get_task(client, "T1"))["attempts"] == 1 or None
+
+    await eventually(t1_was_handed_out)
 
     async def t2_is_untouched() -> None:
         assert (await get_task(client, "T2"))["attempts"] == 0, (
