@@ -1,7 +1,6 @@
 # CodeFleet
 
-Hand a task list to three Claude coding agents and get back one working tree. No branches to merge,
-no conflicts to arbitrate, no agent's work thrown away.
+The file lock for parallel Claude coding agents.
 
 [![ci](https://github.com/ashnkumar/code-fleet/actions/workflows/ci.yml/badge.svg)](https://github.com/ashnkumar/code-fleet/actions/workflows/ci.yml)
 [![python](https://img.shields.io/badge/python-3.12+-blue)](https://www.python.org/downloads/)
@@ -10,8 +9,8 @@ no conflicts to arbitrate, no agent's work thrown away.
 ![Three agents working one repository: T4 is denied a write to api.py because runner-2 holds it for T3, backs off, and succeeds on retry once the file is released.](docs/demo.gif)
 
 A real run: five tasks, three agents, one tree. The red `VETO` is the moment two agents reached for
-the same file — the second one waited instead of overwriting it, and finished on retry. That is a
-genuine race, so it does not fire on every live run; `--dry-run` makes the timing deterministic,
+the same file — the second one was refused instead of overwriting it, and finished on retry. That is
+a genuine race, so it does not fire on every live run; `--dry-run` makes the timing deterministic,
 which is what CI asserts on.
 
 ## Quickstart
@@ -50,8 +49,8 @@ relayed a completion signal or assigned the next batch.
 | | Doing this yourself | With CodeFleet |
 |---|---|---|
 | **Branches** | Five worktrees to merge, or five PRs to triage | One tree. There is nothing to merge |
-| **Conflicts** | Two agents edited the same file and you arbitrate the diff | It never happened. The second agent waited, then built on the first one's finished code |
-| **Wasted runs** | The agent that lost the race did a whole task that gets discarded or hand-merged | It stops at its first contended write and re-runs later, against real code |
+| **Conflicts** | Two agents edited the same file and you arbitrate the diff | The second write is refused outright, not reconciled afterwards. That task re-runs once the file is free |
+| **Wasted runs** | The agent that lost the race did a whole task that gets discarded or hand-merged | It is blocked at its first contended write rather than after a full run, and retries against real code |
 | **Ordering** | You start task B too early against a half-finished tree, or serialize everything | The server holds the dependency graph and releases each task as it unblocks |
 | **Crashes** | A runner dies holding work and you notice eventually | A missed heartbeat fences it and requeues its task |
 
@@ -59,9 +58,10 @@ The obvious alternative is a worktree per agent, and when you want independent b
 reviewing PRs, it is the right one. It trades a write-time collision for a merge-time one: both agents
 finish, one of them was working against a copy that went stale halfway through, and somebody
 reconciles the diff afterwards. CodeFleet takes the other trade. It serializes agents on a contended
-file so the second one starts *after* the first has finished and reads real code instead of conflict
-markers. You lose parallelism on files two agents both want. You never merge, and no agent's run is
-discarded.
+file so the second one starts *after* the first has released it, and reads real code instead of
+conflict markers. You lose parallelism on the files two agents both want, and a blocked task pays for
+however much of its run it had already done. What you never do is reconcile two versions of the same
+file.
 
 ## How it works
 
@@ -98,9 +98,15 @@ Start with `src/codefleet/scheduler.py`. It is the core of the whole thing and i
 
 Before any agent writes, a `PreToolUse` hook matched on `Write|Edit|MultiEdit|NotebookEdit` asks the
 server for a lease on the path. If another agent holds it, the hook returns
-`permissionDecision: "deny"` and **the write never happens**. The denied agent is told who holds the
-file, stops cleanly, and its task is requeued with the contended path folded into its file scope — so
-the scheduler runs it after the holder finishes rather than rolling the dice again.
+`permissionDecision: "deny"` and **that write never happens**. The denied agent is told who holds the
+file, and its task is requeued with the contended path folded into its file scope — so the scheduler
+runs it after the holder releases rather than rolling the dice again.
+
+Only half of that is enforced. A denied tool call does not execute, and that part is the CLI rather
+than the model's cooperation. What the agent does *next* is its own business: the deny carries no
+stop signal, so a session can keep going and reach for a different file. It gets the same answer on
+anything else that is held. The guarantee is per write, not per session, and per write is what the
+scheduling actually rests on.
 
 Two more obvious APIs were rejected first, each for a reason you can re-check against the SDK:
 
@@ -113,8 +119,9 @@ Two more obvious APIs were rejected first, each for a reason you can re-check ag
 out of play, which makes the coordination server the only thing standing between an agent and the
 filesystem. That is why the hook fails *closed* when the server is unreachable, why any path
 resolving outside the working tree is denied locally, why the hook body does nothing but one loopback
-call with a hard timeout, and why the session's tool set is an explicit allowlist with no shell on it.
-A write the matcher never sees is a write the server never gets to veto.
+call with a hard timeout, why the session's tool set is an explicit allowlist with no shell on it, and
+why a `.mcp.json` sitting in the target repository is ignored rather than loaded. A write the matcher
+never sees is a write the server never gets to veto.
 
 The demo graph exercises exactly this. T3 (`api.py`) and T4 (`middleware.py`) declare disjoint scopes,
 so the scheduler runs them together — correctly, by its own rules. But T4 cannot finish without
