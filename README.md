@@ -28,7 +28,7 @@ npm, no separate Claude Code install, because `claude-agent-sdk` ships the CLI a
 
 `codefleet demo` copies `examples/demo-repo` to a scratch workspace, runs three agents over a
 five-task graph, and finishes by running that repo's own test suite. Your checkout is untouched. A
-run costs about $0.20 and takes under a minute.
+run costs about $0.12 and takes under a minute.
 
 **No API key, or don't want to spend anything:**
 
@@ -43,8 +43,8 @@ Free, deterministic, and what CI runs. If something looks wrong before you spend
 ## What you get
 
 One command, a task list, and as many agents as you want to run. When the fleet drains, every task's
-changes are in a single working tree, applied in dependency order, and you run the tests once. Nobody
-relayed a completion signal or assigned the next batch.
+changes are in a single working tree, applied in dependency order, and you run the tests once. You
+start it and read the diff.
 
 | | Doing this yourself | With CodeFleet |
 |---|---|---|
@@ -70,10 +70,13 @@ file.
 - **Runners are deliberately thin.** Register, heartbeat, poll for an assignment, run one session,
   report the result. They hold no queue, evaluate no dependencies, and decide nothing about who does
   what. All of that is server-side, in one place, where you can read it.
-- **The scheduler is a pure function.** `schedule(state, now) -> list[Decision]` takes a frozen
-  snapshot and returns what should happen. It cannot read a clock, open a socket, or touch the
-  database — the server applies what it returns. That is why its tests build state literally and need
-  no fixtures, no event loop, and no database.
+- **The scheduler returns an ordered list, and the order is the contract.**
+  `schedule(state, now) -> list[Decision]` hands back six kinds of decision that the server applies
+  top to bottom in one transaction, because step 5 — placing new work — is only correct against the
+  state steps 1–4 leave behind. A lease held by a runner that just went offline is released by the
+  same transaction, so assignment does not see that path as busy. Apply the list out of order, or
+  half of it, and you co-schedule two tasks onto the same file. Being pure is what makes that
+  testable in three lines with no database; being *ordered* is what makes it right.
 - **Leases are per file and lazy**, acquired at the first write rather than up front from a declared
   scope. A denial is an immediate veto, never a wait, so no agent ever holds one lease while waiting
   on another.
@@ -115,6 +118,7 @@ Two more obvious APIs were rejected first, each for a reason you can re-check ag
 | `can_use_tool` | Looks right — a permission callback the host controls. But it requires streaming-input mode, and it is *shadowed* by `permission_mode="bypassPermissions"` and by every whole-tool entry in `allowed_tools`. The SDK emits a `CanUseToolShadowedWarning` that points you at `PreToolUse` itself. |
 | `permission_mode="acceptEdits"` | It auto-accepts file edits, but leaves every other tool on the standard permission path, which prompts — and an unattended runner has nobody to answer a prompt. It also buys nothing back: the deny still has to arrive as a `PreToolUse` hook either way, since that is the only place the server's answer can reach a tool call before it runs. |
 | `permission_mode="bypassPermissions"` | Stops the prompting, and approves everything that reaches the permission step. The SDK docs say to use it *"with extreme caution"* — reasonably, since it means full system access. `dontAsk` buys the same freedom from prompts by denying what it wasn't told about instead of approving it. |
+| `permission_mode="auto"` | Also stops the prompting, by having *"a model classifier approve or deny permission prompts"*. Our tool surface is seven fixed names, so there is nothing here for a classifier to judge — and a lock whose boundary is a model's opinion is the thing this project exists not to build. |
 
 The session runs `permission_mode="dontAsk"` with `allowed_tools` naming those same seven tools.
 Nothing prompts, and anything that is *not* on the list — a tool from the target repo's own
@@ -128,10 +132,14 @@ loopback call with a hard timeout, why the session's tool set is an explicit all
 on it, and why a `.mcp.json` sitting in the target repository is ignored rather than loaded. A write
 the matcher never sees is a write the server never gets to veto.
 
-The demo graph exercises exactly this. T3 (`api.py`) and T4 (`middleware.py`) declare disjoint scopes,
-so the scheduler runs them together — correctly, by its own rules. But T4 cannot finish without
-registering its middleware in `api.py`, which T3 holds. The declaration was a good-faith guess and it
-was wrong. The lease is what made that safe.
+The demo graph stages exactly this, on purpose. T3 (`api.py`) and T4 (`middleware.py`) declare
+disjoint scopes, so the scheduler runs them together — correctly, by its own rules. But T4's prompt
+tells the agent to register its middleware in `api.py` *before* writing `middleware.py`, and T4's
+declared scope names only `middleware.py`. That is the shape of the mistake someone makes writing a
+file list before reading the code, and in a demo you have to schedule it: staged, the veto fires in
+four of the five recorded live runs; with the collision merely likely rather than ordered, it fired
+in three of six. The agent is free to reorder, which is the whole reason a declared scope cannot be
+the lock.
 
 `SPEC.md` has the rest: the data model, every coordination rule, the full HTTP API, and the
 alternatives that were considered and dropped.
@@ -183,14 +191,23 @@ have to import the SDK to reach it, and that test breaks.
   guarantee is not absolute across them.
 - **A green run is not a verified run.** A task succeeds when its session ends cleanly, which means
   the model stopped — not that what it wrote compiles. Pass `codefleet run --verify "pytest -q"` and
-  let the exit code decide; `codefleet demo` does this with the target repository's own suite.
+  let the exit code decide; `codefleet demo` does this with the target repository's own suite. That
+  command runs over a tree the agents just wrote, so it executes agent-authored code on your machine:
+  the no-shell rule below bounds what happens *during* a task, not what you choose to run after one.
+  Point the fleet at a checkout you would be willing to `git checkout -- .`.
 - **Agents cannot run commands.** The session gets exactly
-  `Read`/`Write`/`Edit`/`MultiEdit`/`NotebookEdit`/`Glob`/`Grep`. `Bash` is excluded because it is a
-  write path no tool-name matcher can see — a shell write would take no lease and appear in no ledger
-  row. The price is that a task cannot run the tests it just wrote, or a linter, or `git`.
+  `Read`/`Write`/`Edit`/`MultiEdit`/`NotebookEdit`/`Glob`/`Grep`. `Bash` is excluded because a shell
+  write takes no lease and lands in no ledger row, and no tool-name matcher can see it coming. Claude
+  Code does ship a sandboxed `Bash` that confines writes to the working tree at the OS level, which
+  bounds the blast radius — but a sandbox policy is fixed when the session starts and a lease is not,
+  so it cannot say *this file, right now, belongs to another runner*. The price is that a task cannot
+  run the tests it just wrote, or a linter, or `git`.
+- **The server has no authentication.** It binds `127.0.0.1` by default, and `codefleet serve --host
+  0.0.0.0` is one flag away from an unauthenticated write API whose task descriptions become agent
+  prompts. Keep it on loopback.
 
 Also: the lease is exclusivity, not authorization, so any uncontended path is granted; leases are per
-path, not per region; one machine, no authentication, no task planning, POSIX only.
+path, not per region; one machine, no task planning, POSIX only.
 
 ## License
 

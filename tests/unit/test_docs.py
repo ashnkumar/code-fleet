@@ -119,6 +119,19 @@ def test_the_acceptedits_rejection_rests_on_what_the_sdk_documents() -> None:
     assert "withdrawn" in SPEC
 
 
+def test_neither_document_says_a_denied_agent_stops_cleanly() -> None:
+    """The deny stops the tool call. Stopping the session is the model cooperating.
+
+    `deny_response` returns no `continue_: false`, so nothing in the mechanism ends
+    the turn — a document that says otherwise describes a guarantee we do not have.
+    """
+    from codefleet.session import deny_response
+
+    assert "continue" not in str(deny_response("blocked")).replace("permissionDecision", "")
+    for document in (README, SPEC):
+        assert "stops cleanly" not in document
+
+
 @pytest.mark.parametrize("tool", SESSION_TOOLS)
 def test_both_documents_name_the_tools_the_session_may_use(tool: str) -> None:
     assert tool in README

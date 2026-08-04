@@ -31,9 +31,10 @@ already in the working tree.
 
 CodeFleet handles (1) with a dependency graph the server evaluates on every state change, and (2)
 with a per-file lease checked *before* the write happens, via a `PreToolUse` hook that can return
-`permissionDecision: "deny"`. The denied agent is told which agent holds the file, stops cleanly,
-and its task is requeued with a widened file scope so the scheduler will not co-schedule the two
-again. The write never lands. That is conflict prevention, not conflict detection.
+`permissionDecision: "deny"`. The write never lands — that part is the CLI, not the model's
+cooperation. The denied agent is told which agent holds the file and instructed to stop, and its task
+is requeued with a widened file scope so the scheduler will not co-schedule the two again. That is
+conflict prevention, not conflict detection.
 
 The secondary goal is legibility. Every state change is one row in one append-only events table.
 That table drives an SSE stream, a terminal dashboard, and a replayable record of any run. If you
@@ -745,9 +746,12 @@ whether a write is safe.** The mode decides whether a *tool* may run; only the h
 this agent holds this file. So a bug in the hook is still a bug in the one thing standing between an
 agent and a file another agent owns. That is why it fails *closed* on an unreachable server, why
 path normalization rejects anything resolving outside the workdir, and why the hook body does
-nothing but one loopback HTTP call with a hard timeout — a `PreToolUse` hook that misses its
-deadline does not fall through to the tool; the CLI stops the turn with "the tool call was not
-executed", which would look like a mysterious agent failure.
+nothing but one loopback HTTP call with a hard timeout. A `PreToolUse` hook that misses its deadline
+does not fall through to the tool — the docs are explicit that "Claude Code doesn't run the tool
+call, Claude receives a tool result stating the hook didn't respond before its timeout, and the turn
+continues." Fail-closed either way, but the model is then reasoning about an infrastructure error it
+cannot act on, so the hook's own 10s deadline (`REQUEST_TIMEOUT_S`) fires first and turns it into an
+explicit deny with a reason worth reading.
 
 **The session is given an explicit tool set, and `Bash` is not in it.** `tools=` is pinned to `Read`,
 `Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `Glob`, `Grep` — the four write tools the matcher
@@ -760,10 +764,18 @@ absent and unapproved, which is the difference between a permission list and a b
 codegen script, a test run that rewrites a fixture — and none of it reaches a `PreToolUse` matcher
 keyed on tool names. Such a write takes no lease and lands in no `file_changes` row, so the veto
 would hold for structured edits and silently not hold for shell ones, which is worse than not holding
-at all: the ledger would under-report what the fleet touched while reading as complete. Gating `Bash`
-instead would mean deciding which paths an arbitrary shell command writes, which is parsing arbitrary
-shell, and being wrong once is exactly the collision this system exists to prevent. `Task` is out for
-the same reason at one remove: a subagent gets its own tool set and would take `Bash` back with it.
+at all: the ledger would under-report what the fleet touched while reading as complete.
+
+The obvious objection is that this is a solved problem: Claude Code ships a sandboxed `Bash` —
+Seatbelt on macOS, bubblewrap on Linux — that confines a command and every child process it spawns to
+the working directory at the OS level, configured through the same `Edit` allow/deny rules used here
+and exposed as `ClaudeAgentOptions.sandbox`. No shell parsing is involved. It is the right tool for
+bounding blast radius, and it does not solve this problem, because the boundary needed here is not
+*this tree* but *this file, right now, belongs to runner-2*. A sandbox policy is fixed when the
+session is constructed; the pinned SDK's client exposes `set_permission_mode` and `set_model` and
+nothing that moves a filesystem rule mid-session. A sandboxed shell write would stay inside the tree,
+take no lease, and land in no `file_changes` row — the same hole, in a smaller box. `Task` is out for
+a related reason at one remove: a subagent gets its own tool set and would take `Bash` back with it.
 
 The cost is real and is not hidden: **an agent cannot run anything inside a task** — not the tests it
 just wrote, not a linter, not `git`. Tasks have to be expressible as edits, and verification is
@@ -780,10 +792,11 @@ Three smaller decisions fall out of this:
   settings, agents, skills, and `CLAUDE.md` — so the tool, agent and skill set in scope is whatever
   that particular developer happens to have installed, and a demo that does not pin it behaves
   differently on every reader's laptop. With `[]` the session sees the CLI built-ins and nothing
-  else, and the `init` frame proves which (§6.4). Note the trap: setting `skills=` silently flips
-  `setting_sources` back to
-  `["user", "project"]`, so if skills are ever enabled, `setting_sources` must be passed explicitly
-  in the same call.
+  else, and the `init` frame proves which (§6.4). Note how `skills=` interacts with this: it defaults
+  `setting_sources` to `["user", "project"]` *only when the caller left it unset*
+  (`subprocess_cli.py`: `if setting_sources is None`). Because this call always passes `[]`
+  explicitly, enabling skills here would not widen it — but a caller who relies on the default and
+  then adds `skills=` gets the host's settings back without asking.
 - **`strict_mcp_config=True`.** `setting_sources=[]` gates settings *files* and nothing more; MCP
   servers load on their own path, and the SDK's default is to take every one it can find. The
   workdir is someone else's checkout — untrusted input by construction — so a `.mcp.json` sitting in
@@ -818,11 +831,14 @@ is mitigated three ways: the veto arrives at the *first* write to the contended 
 agent stops early rather than late; the denied path is folded back into `file_scope` so the retry is
 scheduled against reality (§4.5 step 8); and `max_attempts` bounds the total wasted work.
 
-This is exactly what the demo graph exercises. T3 (`linkstash/api.py`) and T4 (`linkstash/middleware.py`)
-declare disjoint scopes, so the scheduler runs them together — correctly, by its own rules. But T4
-cannot finish without registering its middleware in `api.py`, which T3 holds. T4 is denied, backs
-off, and succeeds on retry once T3 releases. The declared scope was a good-faith guess and it was
-wrong; the lease is what made that safe.
+This is exactly what the demo graph stages, and stages deliberately. T3 (`linkstash/api.py`) and T4
+(`linkstash/middleware.py`) declare disjoint scopes, so the scheduler runs them together — correctly,
+by its own rules. T4's prompt then instructs the agent to register its middleware in `api.py` *before*
+writing `middleware.py`, while T4's declared scope names only `middleware.py`. T4 is denied, backs
+off, and succeeds on retry once T3 releases. The staging is in the ordering, not the outcome: an
+earlier wording that made the collision likely rather than ordered produced the veto in three of six
+recorded live runs, and the shipped wording in four of five. The agent is free to reorder, which is
+the reason a declared scope cannot be the lock.
 
 The point of `file_scope` is that the *scheduler* reads it. A declared scope that only ever reaches
 the agent as a sentence in its prompt is documentation, not coordination: it cannot stop two tasks
@@ -880,13 +896,14 @@ coordination is externalized and legible.
   timeout. This is the simpler thing that works; if the reaping proves unreliable, the upgrade path
   to `ClaudeSDKClient` is local to one module.
 - **Token accounting from `ResultMessage.model_usage`.** `ResultMessage.usage` is an untyped
-  passthrough of the *final* API call's usage plus an `iterations` array — measured at 136/82 tokens
-  in a session whose true totals were 657/94. `model_usage` is the typed, cumulative,
+  passthrough of the *final* API call's usage plus an `iterations` array, so in every session
+  measured here it reported a small fraction of what the session actually spent. `model_usage` is the
+  typed, cumulative,
   per-model record (`inputTokens`, `outputTokens`, `costUSD`), and its `costUSD` sum matches
   `total_cost_usd`. Also: the CLI emits one `AssistantMessage` per content block, all sharing a
   `message_id` and repeating the same `usage` dict, so summing per-message double-counts.
-- **`SystemMessage(subtype="thinking_tokens")` is dropped at the runner.** In a trivial three-turn
-  run, 21 of 32 messages were of that subtype. Persisting them would flood the events table the
+- **`SystemMessage(subtype="thinking_tokens")` is dropped at the runner.** They were the majority of
+  messages in every run measured here. Persisting them would flood the events table the
   dashboard reads, and the SDK's internal stream buffers only 100 messages — a slow consumer
   throttles the agent.
 - **`max_buffer_size` is raised above the 1 MiB default.** A single tool result containing a large
@@ -927,7 +944,7 @@ The questions a design like this has to answer, and how each was answered.
 | D18 | Is the CLI an HTTP client or does it touch the database? | HTTP client, exclusively. | A second writer is a second set of invariants. A CLI that writes to the store directly can leave state the server's own rules would never have produced, and the two disagree about what the fleet is doing. One writer, one set of invariants. |
 | D19 | Can revocation recall a write the hook has already authorized? | No, and the design says so rather than implying otherwise. | Fencing bumps an epoch; the runner learns about it on its next call. A `PreToolUse` hook that already returned *allow* has authorized a filesystem operation nothing can now intercept, so on the cancel, stale and deadline paths a write can land after its lease was released to another task. The fence is as fast as it can be and is still not synchronous with the tool call. Making it synchronous means a write path the server can invalidate mid-flight — per-attempt isolation, or a broker that revalidates the lease at write time — which is a different and larger system (see D12). Documented as a bounded hole in the recovery paths, not papered over. |
 | D20 | Does a requeue undo what the failed attempt already wrote? | No. Its leases are released and its edits stay. | Restoring the pre-attempt tree means knowing what the attempt changed and being sure nobody else has since touched it — in one shared tree with N live agents, neither holds. The honest consequence is that failed and cancelled attempts still influence the final checkout, and it is stated in the README rather than described as merely wasted work. This is the strongest argument for per-attempt isolation, and the reason D12 is a trade rather than a free choice. |
-| D21 | Is the lease an authorization boundary? | No. It is mutual exclusion only. | Acquisition asks whether another task holds the path, never whether this task should be touching it — any uncontended path in the tree is granted. Making declared scope authoritative would break the premise the design rests on: scope is a guess written before the agent read the code, and the demo turns on exactly that guess being wrong. So blast radius is bounded by the working tree, not by the task, and `file_scope` is documented as advisory everywhere it appears. An opt-in strict mode is the obvious next feature; shipping it off-by-default and unexercised would be worse than saying plainly that it does not exist yet. |
+| D21 | Is the lease an authorization boundary? | No. It is mutual exclusion only. | Acquisition asks whether another task holds the path, never whether this task should be touching it — any uncontended path in the tree is granted. Making declared scope authoritative would break the premise the design rests on: scope is written before the agent reads the code, and the demo stages exactly that gap. So blast radius is bounded by the working tree, not by the task, and `file_scope` is documented as advisory everywhere it appears. An opt-in strict mode is the obvious next feature; shipping it off-by-default and unexercised would be worse than saying plainly that it does not exist yet. |
 | D22 | What does `succeeded` mean? | The session ended cleanly and reported success. Not that the code works. | Nothing inside the coordination layer can distinguish an agent that solved the task from one that stopped early and said it had. That distinction has to come from outside, so `codefleet run --verify <command>` runs the caller's own checks over the tree once the fleet drains and its exit code decides the run's. Fleet-level rather than per-task on purpose: agents share one tree, so a suite run mid-flight fails on another agent's half-finished edit and blames the wrong task. Per-task verification needs per-task isolation. |
 
 ---

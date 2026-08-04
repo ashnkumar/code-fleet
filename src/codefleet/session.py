@@ -59,8 +59,11 @@ MAX_BUFFER_SIZE = 32 * 1024 * 1024
 #
 # Bash is absent on purpose, and so is Task. A shell command writes files
 # without ever handing a path to a hook — `sed -i`, a redirect, a formatter, a
-# codegen script, `python -c` — so gating it would mean parsing arbitrary shell,
-# which is not a boundary anyone should trust; Task is excluded because a
+# codegen script, `python -c` — so the write takes no lease and lands in no
+# file_changes row. Claude Code's sandboxed Bash would confine those writes to
+# the tree at the OS level (ClaudeAgentOptions.sandbox), but a sandbox rule is
+# fixed at session construction and a lease is not: it can say "this tree" and
+# never "this file, right now, belongs to runner-2". Task is excluded because a
 # subagent would get its own tool set and take Bash with it. The cost is real:
 # an agent cannot run the test suite or any other command from inside a task.
 # That is the price of the lease being the only way a file changes.
@@ -260,7 +263,12 @@ def allow_response() -> HookJSONOutput:
 
 
 def deny_response(reason: str) -> HookJSONOutput:
-    """The exact shape the CLI accepts as a veto. Verified against a live run."""
+    """The exact shape the CLI accepts as a veto.
+
+    Matches the `PreToolUse` hook output documented for the SDK, and is exercised
+    end to end by the live tier (`tests/live/test_demo_live.py`). Note there is no
+    `continue_: false` here: this stops the tool call, not the session.
+    """
     return {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -574,9 +582,9 @@ def build_options(
 
     `setting_sources=[]` is what makes the run hermetic: the SDK default loads
     the host user's `~/.claude` settings, agents, skills and CLAUDE.md, so
-    without it the same demo behaves differently on every machine. Note that
-    setting `skills=` silently flips this back on — if skills are ever enabled
-    here, `setting_sources` has to be passed again in the same call.
+    without it the same demo behaves differently on every machine. `skills=`
+    defaults `setting_sources` to `["user", "project"]` only when the caller
+    left it unset, so passing `[]` here explicitly keeps it closed either way.
 
     `permission_mode="dontAsk"` is the posture, and it is chosen over
     `bypassPermissions` deliberately. Both stop an unattended runner from

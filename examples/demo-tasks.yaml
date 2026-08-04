@@ -8,12 +8,16 @@
 #                       picked up on the next tick without anyone asking.
 #
 #   write veto          T3 and T4 declare disjoint file scopes, so the
-#                       scheduler runs them at the same time. But T4 cannot
-#                       finish without registering its middleware in api.py,
-#                       which T3 is holding. The second writer is denied at the
-#                       tool call, backs off, and is retried once T3 releases
-#                       the file. That is the realistic failure mode: declared
-#                       scope is a guess, and agents follow the code.
+#                       scheduler runs them at the same time. T4's description
+#                       then tells the agent to touch api.py *first*, and T4's
+#                       file_scope names only middleware.py — the collision is
+#                       staged, deliberately and in the open. The point is not
+#                       that a collision can happen by accident; it is that a
+#                       declared scope is written before anyone reads the code,
+#                       so it cannot be the lock. Staging it is what makes the
+#                       veto reproducible enough to record. Even so the agent
+#                       may reorder: across the recorded live runs it fires
+#                       about four times in five.
 
 tasks:
   - id: T1

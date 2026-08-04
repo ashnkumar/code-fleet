@@ -13,10 +13,12 @@
 # order. Only the waiting goes.
 #
 # This drives the real `codefleet demo`: three runners, five tasks, live Claude
-# Agent SDK sessions against examples/demo-repo. Nothing here is staged. The
-# veto that shows up in the recording is a real denied write.
+# Agent SDK sessions against examples/demo-repo. The run is not staged — the
+# veto in the recording is a real denied write, and the numbers on screen are
+# that run's. The task *graph* is staged: examples/demo-tasks.yaml orders T4 to
+# touch api.py first so the collision is reproducible. See its header.
 #
-# Needs ANTHROPIC_API_KEY in the environment. Costs roughly $0.25 on the
+# Needs ANTHROPIC_API_KEY in the environment. Costs roughly $0.12 on the
 # default model.
 
 Output docs/demo.gif

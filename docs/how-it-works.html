@@ -159,8 +159,8 @@
 
     <div class="note">
       <b>T3 and T4 declare different files</b>, so the scheduler will run them at the same time —
-      correctly, by its own rules. Declared scope is a guess someone wrote before the agent read
-      the code.
+      correctly, by its own rules. T4's prompt then orders it to touch <span class="m">api.py</span>
+      first: the collision is staged, because declared scope is written before anyone reads the code.
     </div>
 
     <div class="foot">Written as YAML, or posted to <span class="m">/tasks</span></div>
@@ -179,7 +179,7 @@
     <div class="server">
       <div class="stitle">Coordination server</div>
       <div class="ssub">schedule(state, now) &rarr; [Decision]</div>
-      <div class="ssub" style="color:#a8afba">assigns · cascades · fences · leases</div>
+      <div class="ssub" style="color:#a8afba">six decisions, applied in order</div>
     </div>
 
     <div class="card" style="margin-top:11px">
@@ -231,7 +231,8 @@
     <div class="card">
       <div class="clabel">What happens next</div>
       <div class="after"><div class="tick">&#8594;</div>
-        <div>The agent is told who holds the file and stops cleanly.</div></div>
+        <div>The write is refused. The agent is told who holds the file &mdash; stopping is the
+        model cooperating.</div></div>
       <div class="after"><div class="tick">&#8594;</div>
         <div>T4 is requeued with <span class="m">api.py</span> folded into its scope.</div></div>
       <div class="after"><div class="tick">&#10003;</div>

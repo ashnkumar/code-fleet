@@ -130,7 +130,8 @@
         <div class="m" style="font-size:12.5px;color:#2d6c8a;font-weight:600">schedule(state, now) &rarr; [Decision]</div>
         <div style="font-size:12px;line-height:1.5;color:#5c6470;margin-top:7px">
           A <b>pure function</b> — it cannot read a clock, open a socket, or touch the database.
-          The engine's tick loop applies the decisions it returns: assign, cascade, fence, expire.
+          It returns six kinds of decision and the engine's tick loop applies them <b>in order</b>,
+          in one transaction: assignment is only correct against what the earlier ones left behind.
         </div>
       </div>
       <div class="card" style="background:var(--green-f);border-color:var(--green-b)">
@@ -186,7 +187,7 @@
 </div>
 
 <div class="conn"><div></div><div class="legs h9" style="justify-content:center">
-  <div class="leg"><span class="glyph">&#9660;</span> only writes the server allowed</div>
+  <div class="leg"><span class="glyph">&#9660;</span> no write without a lease</div>
 </div></div>
 
 <!-- ============ TREE ============ -->
