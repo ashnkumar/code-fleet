@@ -434,7 +434,7 @@ async def test_the_init_frame_is_reported_rather_than_discarded(
         "session_id": "sess_abc",
         "cwd": str((tmp_path / "work").resolve()),
         "model": "claude-haiku-4-5-20251001",
-        "permissionMode": "bypassPermissions",
+        "permissionMode": "dontAsk",
         "tools": ["Read", "Write", "Edit"],
     }
 
@@ -446,7 +446,7 @@ async def test_the_init_frame_is_reported_rather_than_discarded(
         await drive(stub, tmp_path, executor=executor)
 
     assert "claude-haiku-4-5-20251001" in caplog.text
-    assert "permission_mode=bypassPermissions" in caplog.text
+    assert "permission_mode=dontAsk" in caplog.text
     assert "tools=3" in caplog.text
     assert "not the shared tree" not in caplog.text
 

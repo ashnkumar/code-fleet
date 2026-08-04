@@ -667,7 +667,7 @@ Environment, `CODEFLEET_` prefix, every variable listed in a committed `.env.exa
 | --- | --- | --- |
 | `CODEFLEET_HOST` / `CODEFLEET_PORT` | `127.0.0.1` / `8099` | |
 | `CODEFLEET_DB` | `./codefleet.db` | |
-| `CODEFLEET_WORKDIR` | `./examples/demo-repo` | The shared tree. It defaults to the target repo that ships with this one, never to the current directory — a first run points N `bypassPermissions` sessions at a known throwaway checkout rather than at whatever the operator happened to be standing in. |
+| `CODEFLEET_WORKDIR` | `./examples/demo-repo` | The shared tree. It defaults to the target repo that ships with this one, never to the current directory — a first run points N autonomous sessions at a known throwaway checkout rather than at whatever the operator happened to be standing in. |
 | `CODEFLEET_RUNNERS` | `3` | |
 | `CODEFLEET_MODEL` | `claude-haiku-4-5-20251001` | Overridable. |
 | `CODEFLEET_TASK_TIMEOUT` | `600` | Seconds. |
@@ -698,7 +698,8 @@ can be re-checked against the SDK, not on taste.
 
 **Rejected: `can_use_tool`.** It looks like the right API — a permission callback the host controls.
 It is not usable here. It requires streaming-input mode (`ValueError` otherwise), and it is
-*shadowed* the moment `permission_mode="bypassPermissions"` is set: the SDK emits
+*shadowed* the moment `permission_mode="bypassPermissions"` is set — and, on the mode this
+repository actually uses, by every whole-tool entry in `allowed_tools`. Either way the SDK emits
 `CanUseToolShadowedWarning` whose text explicitly directs you to a `PreToolUse` hook instead. It is
 also shadowed by any whole-tool entry in `allowed_tools` (`"Write"`, `"Write()"`, `"Write(*)"`), and
 by `skills="all"`, which silently appends a bare `Skill` entry. Too many ways to disable it by
@@ -717,25 +718,43 @@ pinned SDK: `acceptEdits` writes, both through a bare `query()` and through this
 `run_session` with its hooks installed. Nothing in the repository ever demonstrated the no-write
 result, so the claim is withdrawn rather than re-explained.
 
-**Chosen: `bypassPermissions` + a `PreToolUse` hook.** Empirically, a hook returning
-`permissionDecision: "deny"` vetoes the write, and the denied agent stops cleanly and reports being
-blocked rather than retrying or editing around it. A matching `PostToolUse` hook reliably yields
-`tool_name` and `tool_input.file_path` for `Write`/`Edit`, which is the ledger.
+**Also rejected: `permission_mode="bypassPermissions"`.** It was the original choice here and it
+worked, but it is the wrong default and the SDK documentation says so directly: *"Use with extreme
+caution. Claude has full system access in this mode. Only use in controlled environments where you
+trust all possible operations."* It approves everything reaching the permission step — the failure
+direction a fleet pointed at someone else's checkout cannot afford. Its one real advantage over the
+chosen mode is nothing: both stop an unattended runner hanging on a prompt.
 
-The cost of this choice, stated plainly: **the coordination server is now the only safety boundary.**
-`bypassPermissions` means the CLI's own permission rules are not in play, so a bug in the hook is a
-bug in the only thing standing between an agent and the filesystem. That is why the hook fails
-*closed* on an unreachable server, why path normalization rejects anything resolving outside the
-workdir, and why the hook body does nothing but one loopback HTTP call with a hard timeout — a
-`PreToolUse` hook that misses its deadline does not fall through to the tool; the CLI stops the turn
-with "the tool call was not executed", which would look like a mysterious agent failure.
+**Chosen: `permission_mode="dontAsk"` + `allowed_tools` + a `PreToolUse` hook.** `dontAsk` converts
+any permission prompt into a denial, so nothing hangs and nothing unlisted runs; `allowed_tools`
+names the seven tools that may proceed without asking; and the hook is what turns an approved *tool*
+into an approved *write*. Hooks are evaluated **first**, ahead of deny rules, allow rules and the
+mode itself, so the veto holds under any mode — that ordering is why the hook, not the mode, is the
+load-bearing part. Empirically, a hook returning `permissionDecision: "deny"` vetoes the write and
+the runner reports the task blocked; a matching `PostToolUse` hook reliably yields `tool_name` and
+`tool_input.file_path` for `Write`/`Edit`, which is the ledger.
+
+`dontAsk` also changes what an unenumerated tool does. Under `bypassPermissions` a tool arriving
+from anywhere the allowlist did not cover — a target repository's `.mcp.json`, a plugin, a settings
+file — was auto-approved. Under `dontAsk` it is denied for not being listed. The other guards stay
+anyway (§6.1 `tools=`, `strict_mcp_config=True`): a tool that never enters the session cannot be
+reached by a bug in the layer that does the denying.
+
+The cost of the choice, stated plainly: **the coordination server is still the only thing deciding
+whether a write is safe.** The mode decides whether a *tool* may run; only the hook knows whether
+this agent holds this file. So a bug in the hook is still a bug in the one thing standing between an
+agent and a file another agent owns. That is why it fails *closed* on an unreachable server, why
+path normalization rejects anything resolving outside the workdir, and why the hook body does
+nothing but one loopback HTTP call with a hard timeout — a `PreToolUse` hook that misses its
+deadline does not fall through to the tool; the CLI stops the turn with "the tool call was not
+executed", which would look like a mysterious agent failure.
 
 **The session is given an explicit tool set, and `Bash` is not in it.** `tools=` is pinned to `Read`,
 `Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `Glob`, `Grep` — the four write tools the matcher
 gates, plus three that cannot mutate the tree. Note that this is `tools=`, not `allowed_tools=`:
-under `bypassPermissions` an `allowed_tools` entry would only pre-approve a tool the session already
-has, whereas `tools=` removes everything unnamed from the session entirely, which is the difference
-between a permission list and a boundary.
+`allowed_tools` pre-approves a tool the session already has, whereas `tools=` removes everything
+unnamed from the session entirely. Both are set to `SESSION_TOOLS` — an unlisted tool is then both
+absent and unapproved, which is the difference between a permission list and a boundary.
 
 `Bash` is excluded because it is an *ungated* write path — `sed -i`, `cat > f`, a formatter, a
 codegen script, a test run that rewrites a fixture — and none of it reaches a `PreToolUse` matcher
@@ -769,7 +788,7 @@ Three smaller decisions fall out of this:
   servers load on their own path, and the SDK's default is to take every one it can find. The
   workdir is someone else's checkout — untrusted input by construction — so a `.mcp.json` sitting in
   it would put tools in the session that are not in `tools=`, do not match the write matcher, and are
-  approved without being asked about, because `bypassPermissions` is what asks. That is an ungated
+  not in `allowed_tools`, so `dontAsk` refuses them. That would still be an ungated
   write path arriving through the target repository, which is the `Bash` hole again with a config
   file instead of a shell. `tests/unit/test_session.py` plants a `.mcp.json` in the fixture tree and
   pins both this flag and the SDK default it overrides.

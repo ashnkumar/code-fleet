@@ -7,9 +7,11 @@ CodeFleet — server, scheduler, runner — can be tested with no API key and no
 The module owns three things that are easy to get wrong and were settled
 empirically rather than by reading docs:
 
-* the write veto. `permission_mode="bypassPermissions"` plus a `PreToolUse` hook
-  that returns `permissionDecision: "deny"`. That hook is the only thing standing
-  between an agent and the filesystem, so it fails *closed*: a path it cannot
+* the write veto. `permission_mode="dontAsk"` plus a `PreToolUse` hook that
+  returns `permissionDecision: "deny"`. The mode denies anything not explicitly
+  pre-approved instead of prompting, so an unattended runner never hangs and
+  never auto-approves a tool nobody enumerated; the hook is what turns an
+  approved *tool* into an approved *write*. It fails *closed*: a path it cannot
   place inside the working tree is refused locally, a write tool whose input
   names no path it can read is refused too, and a coordination callback that
   raises denies rather than allows. `SESSION_TOOLS` is the other half of it —
@@ -576,26 +578,36 @@ def build_options(
     setting `skills=` silently flips this back on — if skills are ever enabled
     here, `setting_sources` has to be passed again in the same call.
 
-    `tools=` is the base set the session gets, not a permission list: under
-    `bypassPermissions` an `allowed_tools` entry would only pre-approve, while
-    this removes everything not named from the session entirely. See
-    `SESSION_TOOLS` for why the list is what it is.
+    `permission_mode="dontAsk"` is the posture, and it is chosen over
+    `bypassPermissions` deliberately. Both stop an unattended runner from
+    hanging on a prompt nobody can answer, but they fail in opposite
+    directions: `bypassPermissions` approves everything that reaches the
+    permission step, while `dontAsk` denies anything not explicitly
+    pre-approved. For a fleet pointed at someone else's checkout, deny-by-
+    default is the only defensible choice — a tool that arrives from somewhere
+    we did not enumerate is exactly the case we cannot afford to auto-approve.
+
+    `tools=` and `allowed_tools=` do different jobs and we want both. `tools=`
+    is the base set the session gets at all; `allowed_tools=` is what `dontAsk`
+    consults to decide a call without prompting. Naming the same list twice
+    means an unlisted tool is both absent and unapproved.
 
     `strict_mcp_config=True` closes the gap `setting_sources=[]` leaves open.
     That one gates settings *files*; MCP configuration loads on its own path, so
     without this a target repository carrying a `.mcp.json` would hand the
-    session tools nobody here chose. Those tools are outside `SESSION_TOOLS`,
-    they do not match `WRITE_TOOL_MATCHER`, and under `bypassPermissions` they
-    are approved without being asked about — a write path with no lease behind
-    it, which is the same hole `Bash` is excluded to avoid.
+    session tools nobody here chose. Under `dontAsk` those tools are now denied
+    rather than run, but the flag stays: defence in depth is the point, and a
+    tool that never enters the session cannot be reached by a bug in the
+    layers above it.
     """
     return ClaudeAgentOptions(
         model=settings.model,
         cwd=str(workdir),
-        permission_mode="bypassPermissions",
+        permission_mode="dontAsk",
         setting_sources=[],
         strict_mcp_config=True,
         tools=list(SESSION_TOOLS),
+        allowed_tools=list(SESSION_TOOLS),
         max_turns=settings.max_turns,
         max_budget_usd=settings.task_budget_usd,
         max_buffer_size=MAX_BUFFER_SIZE,

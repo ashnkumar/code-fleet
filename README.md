@@ -112,16 +112,21 @@ Two more obvious APIs were rejected first, each for a reason you can re-check ag
 
 | Rejected | Why |
 |---|---|
-| `can_use_tool` | Looks right — a permission callback the host controls. But it requires streaming-input mode, and it is *shadowed* the moment you set `permission_mode="bypassPermissions"`. The SDK emits a `CanUseToolShadowedWarning` that points you at `PreToolUse` itself. |
+| `can_use_tool` | Looks right — a permission callback the host controls. But it requires streaming-input mode, and it is *shadowed* by `permission_mode="bypassPermissions"` and by every whole-tool entry in `allowed_tools`. The SDK emits a `CanUseToolShadowedWarning` that points you at `PreToolUse` itself. |
 | `permission_mode="acceptEdits"` | It auto-accepts file edits, but leaves every other tool on the standard permission path, which prompts — and an unattended runner has nobody to answer a prompt. It also buys nothing back: the deny still has to arrive as a `PreToolUse` hook either way, since that is the only place the server's answer can reach a tool call before it runs. |
+| `permission_mode="bypassPermissions"` | Stops the prompting, and approves everything that reaches the permission step. The SDK docs say to use it *"with extreme caution"* — reasonably, since it means full system access. `dontAsk` buys the same freedom from prompts by denying what it wasn't told about instead of approving it. |
 
-**The cost of that choice.** `bypassPermissions` takes the CLI's own permission rules
-out of play, which makes the coordination server the only thing standing between an agent and the
-filesystem. That is why the hook fails *closed* when the server is unreachable, why any path
-resolving outside the working tree is denied locally, why the hook body does nothing but one loopback
-call with a hard timeout, why the session's tool set is an explicit allowlist with no shell on it, and
-why a `.mcp.json` sitting in the target repository is ignored rather than loaded. A write the matcher
-never sees is a write the server never gets to veto.
+The session runs `permission_mode="dontAsk"` with `allowed_tools` naming those same seven tools.
+Nothing prompts, and anything that is *not* on the list — a tool from the target repo's own
+`.mcp.json`, a plugin, a settings file — is refused rather than run.
+
+**The cost of that choice.** The mode decides whether a *tool* may run; only the hook knows whether
+this agent holds this file. So the coordination server is still the only thing that can tell a safe
+write from a collision. That is why the hook fails *closed* when the server is unreachable, why any
+path resolving outside the working tree is denied locally, why the hook body does nothing but one
+loopback call with a hard timeout, why the session's tool set is an explicit allowlist with no shell
+on it, and why a `.mcp.json` sitting in the target repository is ignored rather than loaded. A write
+the matcher never sees is a write the server never gets to veto.
 
 The demo graph exercises exactly this. T3 (`api.py`) and T4 (`middleware.py`) declare disjoint scopes,
 so the scheduler runs them together — correctly, by its own rules. But T4 cannot finish without

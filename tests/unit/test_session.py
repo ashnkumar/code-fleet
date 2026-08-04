@@ -588,7 +588,7 @@ def test_the_init_frame_is_captured_whole() -> None:
         "session_id": "sess_abc",
         "cwd": "/tmp/demo-repo",
         "model": "claude-haiku-4-5-20251001",
-        "permissionMode": "bypassPermissions",
+        "permissionMode": "dontAsk",
         "tools": ["Read", "Write", "Edit"],
     }
 
@@ -719,7 +719,15 @@ def test_options_pin_the_posture_the_veto_depends_on(workdir: Path) -> None:
 
     options = build_options(workdir=workdir, settings=settings, hooks={}, stderr=None)
 
-    assert options.permission_mode == "bypassPermissions"
+    # Deny-by-default, not approve-by-default. `bypassPermissions` would also
+    # stop an unattended runner hanging on a prompt, but it approves everything
+    # that reaches the permission step — the opposite failure direction from the
+    # one a fleet pointed at someone else's checkout can afford.
+    assert options.permission_mode == "dontAsk"
+    # The two lists do different jobs: `tools` is what the session has at all,
+    # `allowed_tools` is what `dontAsk` will approve without prompting.
+    assert options.tools == list(SESSION_TOOLS)
+    assert options.allowed_tools == list(SESSION_TOOLS)
     # Hermetic: no host ~/.claude agents, skills or CLAUDE.md.
     assert options.setting_sources == []
     assert options.cwd == str(workdir)
@@ -727,7 +735,6 @@ def test_options_pin_the_posture_the_veto_depends_on(workdir: Path) -> None:
     assert options.max_budget_usd == 0.5
     assert options.max_buffer_size is not None
     assert options.max_buffer_size > 1024 * 1024
-    assert options.tools == list(SESSION_TOOLS)
 
 
 def test_a_target_repository_cannot_hand_the_session_its_own_mcp_tools(workdir: Path) -> None:
@@ -735,9 +742,10 @@ def test_a_target_repository_cannot_hand_the_session_its_own_mcp_tools(workdir: 
 
     `setting_sources=[]` gates settings *files* and stops there; MCP servers load
     on a separate path. A repository that ships a `.mcp.json` — plenty do — would
-    otherwise give the session tools that are not in `SESSION_TOOLS`, do not match
-    `WRITE_TOOL_MATCHER`, and are auto-approved under `bypassPermissions`. That is
-    a write that takes no lease, which is the one thing the whole design is for.
+    otherwise give the session tools that are not in `SESSION_TOOLS` and do not
+    match `WRITE_TOOL_MATCHER`. `dontAsk` denies them for being unlisted, which is
+    the whole reason for preferring it, but a tool that never enters the session
+    cannot be reached by a bug in the layer that does the denying.
 
     Asserting the SDK's default as well is deliberate: the flag only means
     something because the default is permissive, and a default that flipped would
@@ -1099,6 +1107,6 @@ async def test_a_denied_write_never_lands_and_the_runner_reports_it_blocked(tmp_
     assert outcome.blocked_on_path == "settings.py"
     assert target.read_text() == original
     assert outcome.init_frame is not None
-    assert outcome.init_frame["permissionMode"] == "bypassPermissions"
+    assert outcome.init_frame["permissionMode"] == "dontAsk"
     assert outcome.input_tokens > 0
     shutil.rmtree(tree)
