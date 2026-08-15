@@ -373,23 +373,37 @@ async def complete_task(
     attempt cap, goes terminal and lets the next tick block its dependents. A
     veto additionally folds the denied path into `file_scope` (spec 4.5 step 8),
     which is what stops the retry from being a coin flip.
+
+    The report is fenced to the attempt it came from (spec 5.1). The memo is a
+    convenience — it replays the original response for an ordinary redelivery —
+    and every case it cannot answer is caught by the row, which is durable:
+    applying a report always either finishes the task or clears its owner, so a
+    report that matches a live assignment is always a first delivery.
     """
     store = server.store
     now = utcnow()
     async with store.transaction():
         task = await _require_task(store, task_id)
-        memo_key = (task_id, agent.id, task.attempts)
+        memo_key = (task_id, agent.id, result.attempt)
         recorded = server.completions.get(memo_key)
         if recorded is not None:
             return recorded
+        if result.attempt != task.attempts:
+            # A report about an attempt that is no longer the live one. Ownership
+            # says nothing useful here: a requeued attempt handed back to the same
+            # agent puts a fresh attempt behind the same `(task, agent)` pair, and
+            # that agent is once again the legitimate owner. The attempt number is
+            # the only thing that separates the two reports, which is why the tuple
+            # needs its third element.
+            return {"status": task.status, "attempts": task.attempts, "duplicate": True}
         _require_owner(task, agent)
         if task.status.is_terminal:
-            # A duplicate the memo above could not answer: it was lost with the
-            # process, or this is a second delivery of the same report. The
-            # attempt is already recorded, and re-applying it would double the
-            # token and cost counters and fire the cascade a second time.
-            # Requeued attempts need no equivalent guard — a requeue clears
-            # `assigned_agent_id`, so `_require_owner` has already rejected them.
+            # A duplicate the memo could not answer: it was lost with the process,
+            # or this is a second delivery of the same report. The attempt is
+            # already recorded, and re-applying it would double the token and cost
+            # counters and fire the cascade a second time. A requeued attempt needs
+            # no equivalent guard — a requeue clears `assigned_agent_id`, so
+            # `_require_owner` has already rejected it.
             return {"status": task.status, "attempts": task.attempts, "duplicate": True}
 
         task = await store.update_task(

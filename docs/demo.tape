@@ -46,7 +46,7 @@ Sleep 6s
 #
 # mpdecimate finds frames identical to their predecessor; setpts replays the
 # survivors at 12fps; tpad holds the final verdict so it is readable in a loop.
-# The two-pass palette keeps the terminal colours clean at 128 colours.
+# The two-pass palette keeps the terminal colors clean at 128 colors.
 #
 #   ffmpeg -i docs/demo.gif -vf \
 #     "mpdecimate=hi=512:lo=256:frac=0.2,setpts=N/12/TB,tpad=stop_mode=clone:stop_duration=2.5,fps=12,palettegen=stats_mode=diff:max_colors=128" \

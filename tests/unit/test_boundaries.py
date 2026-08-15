@@ -127,7 +127,7 @@ def test_the_runner_holds_no_coordination_logic(modules: dict[str, Path], forbid
         "the server already committed, and reports; it does not decide anything. Touching "
         f"{forbidden} means it now evaluates dependencies, compares file scopes or writes "
         "coordination state itself — three copies of the policy that have to agree, and a "
-        "fleet whose behaviour depends on which runner build is deployed."
+        "fleet whose behavior depends on which runner build is deployed."
     )
 
 

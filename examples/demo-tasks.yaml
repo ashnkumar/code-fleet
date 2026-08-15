@@ -1,6 +1,6 @@
 # The task graph `codefleet demo` runs against examples/demo-repo.
 #
-# It is shaped to exercise the two behaviours that are hard to see in a
+# It is shaped to exercise the two behaviors that are hard to see in a
 # screenshot and easy to fake in a README:
 #
 #   dependency cascade  T1 -> T2 and T3 -> T5. T2 and T5 are unblocked by the

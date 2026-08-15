@@ -36,9 +36,11 @@ cooperation. The denied agent is told which agent holds the file and instructed 
 is requeued with a widened file scope so the scheduler will not co-schedule the two again. That is
 conflict prevention, not conflict detection.
 
-The secondary goal is legibility. Every state change is one row in one append-only events table.
-That table drives an SSE stream, a terminal dashboard, and a replayable record of any run. If you
-want to know what the fleet did, you read one table.
+The secondary goal is legibility. Every state transition is one row in one append-only events table.
+That table drives an SSE stream, the dashboard's log, and a replayable record of any run. If you want
+to know what the fleet did, you read one table. Current values are a separate question with a
+separate answer: `GET /state` returns them, and the dashboard's tables come from there rather than
+from a local replay of events (§5.3).
 
 ---
 
@@ -53,9 +55,9 @@ want to know what the fleet did, you read one table.
 | Runner | `codefleet.runner` | Thin agent process. Registers, heartbeats, polls, runs one SDK session per task, reports. Thin is defined by what it may not import — neither `codefleet.store` nor `codefleet.scheduler` — not by a line budget; `tests/unit/test_boundaries.py` enforces it. |
 | SDK session | `codefleet.session` | Builds `ClaudeAgentOptions`, installs the two hooks, drains the message stream, extracts usage. |
 | CLI | `codefleet.cli` | `codefleet serve`, `codefleet run`, `codefleet watch`, `codefleet tasks`, `codefleet load`, `codefleet demo`, `codefleet doctor`, `codefleet reset`. |
-| Dashboard | `codefleet.dashboard` | Rich terminal view. Consumes `GET /events/stream`. Read-only; holds no state the server does not have. |
+| Dashboard | `codefleet.dashboard` | Rich terminal view. Tables from `GET /state`, log and pacing from `GET /events/stream`. Read-only; holds no state the server does not have. |
 | Models | `codefleet.models` | Entities, transient DTOs, and every enum the rest of the system is typed against — including the gated write-tool set the hook matcher is built from. |
-| Configuration | `codefleet.config` | `Settings`. One environment-backed object, no config file; `.env.example` is its documentation. |
+| Configuration | `codefleet.config` | `Settings`. One environment-backed object, optionally loaded from `.env`; no separate config schema. `.env.example` is its documentation. |
 | Demo target | `examples/demo-repo` | `linkstash`, a ~130-line stdlib URL shortener with a passing test suite of its own. The codebase the fleet edits. |
 | Demo graph | `examples/demo-tasks.yaml` | Five tasks shaped to force one real dependency cascade and one real write veto. |
 
@@ -279,18 +281,18 @@ and it is exactly the body of `POST /tasks/{id}/complete`.
 `FleetState` — a frozen snapshot (`tasks`, `deps`, `agents`, `leases`, `now`) handed to the pure
 scheduler. Constructed literally in unit tests.
 
-### 3.10 Fields deliberately not modelled
+### 3.10 Fields deliberately not modeled
 
 The schema above is small on purpose. Each of the following is an obvious thing to put in a task or
 agent row, and each is left out for a reason worth stating.
 
-| Not modelled | Why |
+| Not modeled | Why |
 | --- | --- |
 | Embeddings of the task description (`semantic_text`, `dense_vector`, or similar) | Their only consumer would be a "find similar tasks" query. Semantic dedup of tasks is a non-goal (§8). An embedding column commits the schema, the write path and a model dependency to a feature nothing in the coordination path reads. |
 | A dashboard definition format (saved objects, data views, NDJSON) | The dashboard is a client of `GET /events/stream`, not a document imported into a separate tool. A dashboard that ships as a definition file has to be re-created wherever it lands; one that reads the events table works the moment the server is up. |
 | Planner artifacts — decomposition prompts, tool and agent declarations | Tasks come from a YAML file or `POST /tasks`. Task decomposition by an LLM is out of scope (§8, D17). |
 | `blocked_by` on the task | It double-books `task_dependencies`. Two stored representations of one graph need something to keep them equal, and every write path that touches one and not the other is drift — the failure mode being a task whose `depends_on` is set, whose blocker list is empty, and which is therefore immediately eligible for assignment. Runnability is derived instead (§4.1). |
-| `estimated_complexity` | Nothing would read it, and nothing here schedules on it — ordering is `(priority, created_at, id)`. A field whose validator quietly coerces an unrecognised value to a default is worse than no field: it accepts bad input and hands back a confident answer. |
+| `estimated_complexity` | Nothing would read it, and nothing here schedules on it — ordering is `(priority, created_at, id)`. A field whose validator quietly coerces an unrecognized value to a default is worse than no field: it accepts bad input and hands back a confident answer. |
 | `labels` | Nothing would read it. Free-form tagging is a task-tracker feature; the scheduler needs `priority`, `file_scope` and the edge table. |
 | `Agent.capabilities` | Capability routing is a non-goal (§8). Any idle agent can take any task, so the assigner matches on `status` and idleness alone, and there is nothing on the task side to match capabilities against. |
 | `Agent.type` | One value. A single-member enum is a column that carries no information. |
@@ -460,11 +462,15 @@ enforced on both sides — liveness and progress are different questions and nee
    }}
    ```
 
-6. The write does not happen. The agent stops and reports being blocked — verified empirically.
+6. The write does not happen — that part is enforced, and it is the only part that is. What the agent
+   does next is cooperation: `permissionDecisionReason` asks it to stop and report rather than work
+   around the block, and in every recorded run it has. Nothing prevents it from editing a file it
+   still holds a lease on instead, and no test asserts that it does not.
 7. The runner reports `ok=false, error_kind=veto, blocked_on_path="linkstash/api.py"`.
-8. The server requeues the task with `attempts += 1`, `backoff_until = now + backoff`, **and widens
-   `file_scope` to include the denied path**. On the next tick step 3 of §4.2 will no longer
-   co-schedule it with the holder, so the retry runs after the holder finishes.
+8. The server requeues the task with `backoff_until = now + backoff` **and widens `file_scope` to
+   include the denied path**. `attempts` is not touched — it counts transitions into `assigned`
+   (§4.7), so the retry's assignment is what charges the next one. On the next tick step 3 of §4.2
+   will no longer co-schedule it with the holder, so the retry runs after the holder finishes.
 
 Step 8 is the loop-closer: it turns a one-off veto into a scheduling fact, so the retry is not a
 coin flip.
@@ -599,7 +605,7 @@ short timeout and never vetoes.
 #### `POST /tasks/{task_id}/complete`
 
 ```json
-→ {"agent_id": "a_9f...", "ok": false,
+→ {"agent_id": "a_9f...", "attempt": 2, "ok": false,
    "summary": null,
    "error": "Blocked: linkstash/api.py is held by runner-2.",
    "error_kind": "veto",
@@ -610,8 +616,15 @@ short timeout and never vetoes.
 ← 200 {"status": "pending", "attempts": 2, "backoff_until": "2026-07-31T18:05:00.000Z"}
 ```
 
-Idempotent on `(task_id, agent_id, attempt)`: a duplicate report for an attempt already recorded is a
-no-op `200`.
+Fenced on `(task_id, agent_id, attempt)`, and `attempt` is the part that does the work: a requeued
+task can be handed back to the agent that just failed it, so `(task_id, agent_id)` alone names two
+different attempts. A report is applied at most once. An in-process memo replays the original
+response for an ordinary redelivery; every case the memo cannot answer is caught by the row, which is
+durable. A report whose `attempt` is not the task's current one, or whose task is already terminal, is
+a no-op `200` carrying `"duplicate": true`; a report for a task the agent no longer owns is `409
+not_owner`, which the runner treats as an assignment that moved on. Nothing here depends on the memo
+surviving a restart — applying a report always either finishes the task or clears its owner, so a
+report that still matches a live assignment is always a first delivery.
 
 ### 5.2 Operator-facing endpoints
 
@@ -656,13 +669,22 @@ data: {"id":1043,"at":"2026-07-31T18:05:07.441Z","type":"lease_denied",
 A `: ping` comment every 15 s keeps intermediaries from closing an idle stream. The `event:` field
 carries the `EventType`, so a client can subscribe selectively.
 
-Because the stream is a pure projection of an append-only table, a run is fully replayable:
-`GET /events?since=0` after the fact reproduces the dashboard frame-for-frame, and the demo recording
-is generated from a real run rather than staged.
+Because the stream is a pure projection of an append-only table, every transition a run made is
+replayable after the fact: `GET /events?since=0` returns the whole ordered log, which is what the
+narration, the timings and the veto in any run can be reconstructed from. It is not a video. The
+dashboard's task, agent and lease tables are re-read from `GET /state` rather than rebuilt by
+replaying events into a local reducer — a second implementation of the state machine is a second
+thing that can be wrong — so a replay recovers the log, not the historical frames. Reconstructing
+those would need a reducer this project deliberately does not have.
+
+The demo recording is captured from a live-agent run of the deliberately staged graph (§7), not from
+the scripted dry run.
 
 ### 5.4 Configuration
 
-Environment, `CODEFLEET_` prefix, every variable listed in a committed `.env.example`.
+Environment, `CODEFLEET_` prefix, every variable listed in a committed `.env.example`. Pydantic
+Settings also reads a `.env` file in the working directory, so `.env` is a place to put the same
+variables rather than a second, differently-shaped configuration format.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
@@ -767,19 +789,29 @@ would hold for structured edits and silently not hold for shell ones, which is w
 at all: the ledger would under-report what the fleet touched while reading as complete.
 
 The obvious objection is that this is a solved problem: Claude Code ships a sandboxed `Bash` —
-Seatbelt on macOS, bubblewrap on Linux — that confines a command and every child process it spawns to
-the working directory at the OS level, configured through the same `Edit` allow/deny rules used here
-and exposed as `ClaudeAgentOptions.sandbox`. No shell parsing is involved. It is the right tool for
-bounding blast radius, and it does not solve this problem, because the boundary needed here is not
-*this tree* but *this file, right now, belongs to runner-2*. A sandbox policy is fixed when the
+Seatbelt on macOS, bubblewrap on Linux — whose boundary the OS enforces on the command and every
+child process it spawns, exposed as `ClaudeAgentOptions.sandbox`. Its defaults are worth stating
+exactly, because "sandbox" suggests more than it grants: writes are confined to the working directory
+and the session temp directory, reads reach the rest of the computer unless denied, network egress is
+a separate policy, and a command that cannot be sandboxed falls back to ordinary permission
+evaluation. No shell parsing is involved. It is the right tool for bounding write blast radius, and
+it does not solve this problem, because the boundary needed here is not *this tree* but *this file,
+right now, belongs to runner-2*. A sandbox policy is fixed when the
 session is constructed; the pinned SDK's client exposes `set_permission_mode` and `set_model` and
 nothing that moves a filesystem rule mid-session. A sandboxed shell write would stay inside the tree,
-take no lease, and land in no `file_changes` row — the same hole, in a smaller box. `Task` is out for
-a related reason at one remove: a subagent gets its own tool set and would take `Bash` back with it.
+take no lease, and land in no `file_changes` row — the same hole, in a smaller box.
+
+The subagent tool is out for a related reason at one remove. It is named `Agent` in the tool calls
+the pinned CLI emits and `Task` in the tool list its `system:init` message carries, and neither is in
+`SESSION_TOOLS`. A subagent's tool set is configured separately from its parent's, through
+`AgentDefinition.tools` for an agent this project would have to define or through the built-in
+`general-purpose` agent for one it would not — and a second tool surface, governed by a second set of
+rules, is not something the hook contract here reasons about. Whether a subagent could reach `Bash`
+from a parent that has none is a question this project answers by not asking it.
 
 The cost is real and is not hidden: **an agent cannot run anything inside a task** — not the tests it
 just wrote, not a linter, not `git`. Tasks have to be expressible as edits, and verification is
-something that happens to the tree afterwards; `codefleet demo` runs the target repository's own
+something that happens to the tree afterward; `codefleet demo` runs the target repository's own
 suite itself, once, after the fleet drains.
 
 Three smaller decisions fall out of this:
@@ -842,8 +874,8 @@ the reason a declared scope cannot be the lock.
 
 The point of `file_scope` is that the *scheduler* reads it. A declared scope that only ever reaches
 the agent as a sentence in its prompt is documentation, not coordination: it cannot stop two tasks
-from being started against the same file, and it makes the fleet's behaviour depend on whether a
-model chose to honour a request. Here it is an input to step 3 of the assignment algorithm, and the
+from being started against the same file, and it makes the fleet's behavior depend on whether a
+model chose to honor a request. Here it is an input to step 3 of the assignment algorithm, and the
 lease is the enforcement behind it.
 
 ### 6.3 Dumb runner, smart server — and how to falsify it
@@ -895,15 +927,18 @@ coordination is externalized and legible.
   terminate/kill escalation and orphan a CLI subprocess, so the runner reaps its child explicitly on
   timeout. This is the simpler thing that works; if the reaping proves unreliable, the upgrade path
   to `ClaudeSDKClient` is local to one module.
-- **Token accounting from `ResultMessage.model_usage`.** `ResultMessage.usage` is an untyped
-  passthrough of the *final* API call's usage plus an `iterations` array, so in every session
-  measured here it reported a small fraction of what the session actually spent. `model_usage` is the
-  typed, cumulative,
-  per-model record (`inputTokens`, `outputTokens`, `costUSD`), and its `costUSD` sum matches
-  `total_cost_usd`. Also: the CLI emits one `AssistantMessage` per content block, all sharing a
-  `message_id` and repeating the same `usage` dict, so summing per-message double-counts.
-- **`SystemMessage(subtype="thinking_tokens")` is dropped at the runner.** They were the majority of
-  messages in every run measured here. Persisting them would flood the events table the
+- **Token accounting from `ResultMessage.model_usage`.** `usage` is untyped in the pinned SDK and the
+  documentation describes it as the top-level agent loop's usage while recommending `model_usage` for
+  whole-tree accounting. What we measured, rather than what we can cite: in every session measured
+  here `usage` reported a small fraction of what the session actually spent, and its shape included
+  an `iterations` array. `model_usage` is the typed per-model record (`inputTokens`, `outputTokens`,
+  `costUSD`), and its `costUSD` sum matched `total_cost_usd` in every run. A second observation from
+  the same measurements, also uncited: several `AssistantMessage` values arrived sharing one
+  `message_id` and repeating the same `usage` dict, so summing per-message double-counted. The
+  decision rests on the agreement between `model_usage` and `total_cost_usd`, which anyone can
+  re-measure; the mechanism behind the undercount is inference.
+- **`SystemMessage(subtype="thinking_tokens")` is dropped at the runner.** They were the most frequent
+  message type in the sessions measured here. Persisting them would flood the events table the
   dashboard reads, and the SDK's internal stream buffers only 100 messages — a slow consumer
   throttles the agent.
 - **`max_buffer_size` is raised above the 1 MiB default.** A single tool result containing a large
@@ -934,7 +969,7 @@ The questions a design like this has to answer, and how each was answered.
 | D8 | How are file changes observed — hooks or `git diff`? | `PostToolUse` hooks. | In one shared tree with N concurrent agents, `git diff` cannot attribute a change to an agent. Hooks give per-agent, per-tool attribution in real time. Accepted tradeoff: hooks record intent, including edits later reverted. |
 | D9 | Does `FileChange` survive as an entity? | Yes, as a narrow `(task, agent, path, tool, at)` ledger. | Narrow and indexable, and it is the audit trail for "what did this run actually touch". Recording it once as a typed row — rather than also as an untyped blob inside an event payload — means one place to query and no second copy to keep honest. |
 | D10 | Does `Conflict` persist, or is it a query? | Persists, as immutable rows. No resolution state machine. | The moment of denial is a fact worth keeping; a four-state lifecycle with nothing driving it is not. |
-| D11 | Where does token/cost accounting come from? | `ResultMessage.model_usage`, summed across models; cost from `total_cost_usd`. Per-task totals only, accumulated per agent. | `ResultMessage.usage` is the last API call's usage, not the session's, and per-`AssistantMessage` summing double-counts. |
+| D11 | Where does token/cost accounting come from? | `ResultMessage.model_usage`, summed across models; cost from `total_cost_usd`. Per-task totals only, accumulated per agent. `ResultMessage.usage` undercounted the session in every run measured here, and per-`AssistantMessage` summing double-counts. `model_usage` is what the SDK documentation recommends for whole-tree accounting, and its `costUSD` sum agrees with `total_cost_usd`. |
 | D12 | What is the isolation model? | One shared working tree. No git worktrees, no branches. | The problem being solved is *coordination on one codebase*. Worktrees would convert a write-time collision into a merge-time collision, which is a strictly harder problem and a different project. A shared tree with a write-time veto is the honest version of this shape: N agents really are editing one checkout, and the protection is checked before the write rather than promised in a document. |
 | D13 | What is the concurrency-control story? | One process, one scheduler, SQLite WAL, `BEGIN IMMEDIATE` for the assignment transaction, `busy_timeout` set. Lease exclusion is a PK constraint, not application logic. | Without it, two schedulers could assign the same task twice and safety would rest on the accident that assignment happens once per tick. Making exclusion a primary key means the database enforces it whatever the application believes. |
 | D14 | Do heartbeats emit events? | No. Only state transitions do. | Heartbeats are liveness, not history. Emitting them would flood the table the dashboard, the SSE stream, and the recording all read from. |
@@ -943,9 +978,10 @@ The questions a design like this has to answer, and how each was answered.
 | D17 | Is there a planner that decomposes a request into tasks? | Not in v1. Tasks come from `POST /tasks` or a YAML file. | It is a separable concern, and it is the part of a system like this that most easily absorbs the entire complexity budget. The interesting claim here is the coordination, and a planner would sit cleanly on top of the same API later. |
 | D18 | Is the CLI an HTTP client or does it touch the database? | HTTP client, exclusively. | A second writer is a second set of invariants. A CLI that writes to the store directly can leave state the server's own rules would never have produced, and the two disagree about what the fleet is doing. One writer, one set of invariants. |
 | D19 | Can revocation recall a write the hook has already authorized? | No, and the design says so rather than implying otherwise. | Fencing bumps an epoch; the runner learns about it on its next call. A `PreToolUse` hook that already returned *allow* has authorized a filesystem operation nothing can now intercept, so on the cancel, stale and deadline paths a write can land after its lease was released to another task. The fence is as fast as it can be and is still not synchronous with the tool call. Making it synchronous means a write path the server can invalidate mid-flight — per-attempt isolation, or a broker that revalidates the lease at write time — which is a different and larger system (see D12). Documented as a bounded hole in the recovery paths, not papered over. |
-| D20 | Does a requeue undo what the failed attempt already wrote? | No. Its leases are released and its edits stay. | Restoring the pre-attempt tree means knowing what the attempt changed and being sure nobody else has since touched it — in one shared tree with N live agents, neither holds. The honest consequence is that failed and cancelled attempts still influence the final checkout, and it is stated in the README rather than described as merely wasted work. This is the strongest argument for per-attempt isolation, and the reason D12 is a trade rather than a free choice. |
+| D20 | Does a requeue undo what the failed attempt already wrote? | No. Its leases are released and its edits stay. | Restoring the pre-attempt tree means knowing what the attempt changed and being sure nobody else has since touched it — in one shared tree with N live agents, neither holds. The consequence is that failed and cancelled attempts still influence the final checkout, which is a stronger statement than "the work was wasted" and is recorded here rather than softened. This is the strongest argument for per-attempt isolation, and the reason D12 is a trade rather than a free choice. |
 | D21 | Is the lease an authorization boundary? | No. It is mutual exclusion only. | Acquisition asks whether another task holds the path, never whether this task should be touching it — any uncontended path in the tree is granted. Making declared scope authoritative would break the premise the design rests on: scope is written before the agent reads the code, and the demo stages exactly that gap. So blast radius is bounded by the working tree, not by the task, and `file_scope` is documented as advisory everywhere it appears. An opt-in strict mode is the obvious next feature; shipping it off-by-default and unexercised would be worse than saying plainly that it does not exist yet. |
 | D22 | What does `succeeded` mean? | The session ended cleanly and reported success. Not that the code works. | Nothing inside the coordination layer can distinguish an agent that solved the task from one that stopped early and said it had. That distinction has to come from outside, so `codefleet run --verify <command>` runs the caller's own checks over the tree once the fleet drains and its exit code decides the run's. Fleet-level rather than per-task on purpose: agents share one tree, so a suite run mid-flight fails on another agent's half-finished edit and blames the wrong task. Per-task verification needs per-task isolation. |
+| D23 | What fences a completion report? | The `attempt` the runner was assigned, carried in the report body and checked against the row. | `(task_id, agent_id)` is not unique over time: a requeued task can be handed straight back to the agent that just failed it, which makes that agent the legitimate owner of a *different* attempt. Without the third element a report delayed past a requeue-and-reassignment passes the owner check and lands on the attempt now running — a stale success marking a task done while an agent is still working on it. Deriving the attempt server-side from the current row would ask which attempt is running now, which is the bug rather than the fix. The durable guarantee comes from the row, not from the in-process memo: applying a report always either finishes the task or clears its owner, so a report that still matches a live assignment is always a first delivery. |
 
 ---
 
@@ -965,7 +1001,9 @@ demonstrate the thing this is about, and several would obscure it.
   it would mean swapping the store and adding leader election, and it would not make the veto more
   interesting.
 - **Authentication, authorization, multi-tenancy.** The server binds to `127.0.0.1` by default and
-  assumes a trusted single-operator context. This is stated in the README rather than half-built.
+  assumes a trusted single-operator context. `codefleet serve --host 0.0.0.0` is one flag away from
+  an unauthenticated write API whose task descriptions become agent prompts, so keep it on loopback.
+  Named as out of scope rather than half-built; the README points here.
 - **A web UI.** The dashboard is a terminal client over SSE. The SSE stream is public API, so a web
   UI is a downstream project, not a missing feature.
 - **Semantic search over tasks / duplicate detection.** No embeddings, no similarity search over
@@ -973,7 +1011,7 @@ demonstrate the thing this is about, and several would obscure it.
 - **Session resumption after a crash.** Sessions are per-task and per-attempt; a failed attempt
   starts fresh. Resuming would require persisting the session id at the `init` message and a defined
   resume path, and a fresh attempt against a partially-modified tree is the more predictable
-  behaviour.
+  behavior.
 - **Cost governance beyond per-task caps.** There is a per-task `max_budget_usd` and a turn cap.
   There is no fleet-wide budget, no spend alerting, and no rate-limit backoff policy beyond
   respecting the SDK's `RateLimitEvent`.
@@ -996,20 +1034,21 @@ Stated here because it constrains the design, not because it is an implementatio
 | Scheduler unit tests | always | nothing. No DB, no event loop, no fixtures. `FleetState` is built literally. |
 | Store + API tests | always | a temp-file SQLite DB and `httpx.ASGITransport`. No network. |
 | Coordination tests | always | the real `Runner` with a `ScriptedExecutor`, against the real server. No API key, no `claude_agent_sdk` import. |
-| Live end-to-end | `-m live`, deselected by default | `ANTHROPIC_API_KEY`. Runs the demo graph against `examples/demo-repo` and asserts: the cascade fired, exactly one veto occurred, the vetoed task succeeded on retry, and `demo-repo`'s own test suite still passes. |
+| Live end-to-end | `-m live`, deselected by default | `ANTHROPIC_API_KEY`. Runs the demo graph against `examples/demo-repo` and asserts: the cascade fired, at least one veto occurred, the vetoed task succeeded on retry, and `demo-repo`'s own test suite still passes. Retries the whole run up to `VETO_ATTEMPTS` times before failing, because the collision is ordered rather than guaranteed (§7). |
 
 The three always-tiers are unconditional. They import nothing optional, so there is no guard that
 could turn the suite green by skipping itself, and a test that asserts a coordination rule asserts
-the real thing rather than the behaviour of a mock standing in for it.
+the real thing rather than the behavior of a mock standing in for it.
 
 Specific tests the design owes:
 
 - Every `EventType` member is emitted at least once during the scripted demo run.
 - N scripted runners racing for one path: exactly one `allow`, N−1 `deny`, one lease row.
 - A stale agent's leases are released in the same transaction as its task requeue.
-- A vetoed task's `file_scope` contains the denied path afterwards, and the scheduler no longer
+- A vetoed task's `file_scope` contains the denied path afterward, and the scheduler no longer
   co-schedules it with the holder.
 - `attempts` exhaustion moves a task to `failed` and its dependents to `blocked_upstream`.
 - No module under `codefleet/` except `codefleet.session` imports `claude_agent_sdk`.
 - No module under `codefleet.runner` imports `codefleet.store`.
-- The SSE stream replayed from `since=0` reproduces the same terminal frames as the live run.
+- `GET /events?since=0` after a run returns the same ordered transitions the stream delivered live.
+- A completion report naming an attempt the task has moved past is never applied.

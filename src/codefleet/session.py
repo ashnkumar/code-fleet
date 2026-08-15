@@ -19,9 +19,10 @@ empirically rather than by reading docs:
 * hermeticity. `setting_sources=[]` keeps the host user's `~/.claude` agents,
   skills and CLAUDE.md out of the session, and the captured `init` frame is the
   record proving it.
-* accounting. Tokens come from `ResultMessage.model_usage`, which is the
-  cumulative per-model record; `ResultMessage.usage` is the last API call only,
-  and per-`AssistantMessage` usage repeats itself once per content block.
+* accounting. Tokens come from `ResultMessage.model_usage`, the typed per-model
+  record the SDK documents for whole-tree accounting. `ResultMessage.usage`
+  undercounted every session measured here, and per-`AssistantMessage` usage was
+  observed repeating itself across messages sharing one `message_id`.
 """
 
 from __future__ import annotations
@@ -57,16 +58,20 @@ MAX_BUFFER_SIZE = 32 * 1024 * 1024
 # name their target in their tool input, so the hook can resolve a path and ask
 # the coordination server for a lease before the write lands.
 #
-# Bash is absent on purpose, and so is Task. A shell command writes files
-# without ever handing a path to a hook — `sed -i`, a redirect, a formatter, a
-# codegen script, `python -c` — so the write takes no lease and lands in no
-# file_changes row. Claude Code's sandboxed Bash would confine those writes to
-# the tree at the OS level (ClaudeAgentOptions.sandbox), but a sandbox rule is
-# fixed at session construction and a lease is not: it can say "this tree" and
-# never "this file, right now, belongs to runner-2". Task is excluded because a
-# subagent would get its own tool set and take Bash with it. The cost is real:
-# an agent cannot run the test suite or any other command from inside a task.
-# That is the price of the lease being the only way a file changes.
+# Bash is absent on purpose, and so is the subagent tool. A shell command writes
+# files without ever handing a path to a hook — `sed -i`, a redirect, a
+# formatter, a codegen script, `python -c` — so the write takes no lease and
+# lands in no file_changes row. Claude Code's sandboxed Bash would confine those
+# writes to the tree and the session temp dir at the OS level
+# (ClaudeAgentOptions.sandbox), but a sandbox rule is fixed at session
+# construction and a lease is not: it can say "this tree" and never "this file,
+# right now, belongs to runner-2". The subagent tool — `Agent` in the tool calls
+# the pinned CLI emits, `Task` in its system:init tool list — is out because a
+# subagent's tool set is configured separately from its parent's, and a second
+# tool surface under a second set of rules is not one this hook contract reasons
+# about. The cost is real: an agent cannot run the test suite or any other
+# command from inside a task. That is the price of the lease being the only way
+# a file changes.
 SESSION_TOOLS: tuple[str, ...] = (
     "Read",
     "Write",
@@ -604,7 +609,7 @@ def build_options(
     That one gates settings *files*; MCP configuration loads on its own path, so
     without this a target repository carrying a `.mcp.json` would hand the
     session tools nobody here chose. Under `dontAsk` those tools are now denied
-    rather than run, but the flag stays: defence in depth is the point, and a
+    rather than run, but the flag stays: defense in depth is the point, and a
     tool that never enters the session cannot be reached by a bug in the
     layers above it.
     """

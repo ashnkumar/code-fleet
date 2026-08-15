@@ -1030,7 +1030,7 @@ async def test_a_stderr_line_arriving_after_the_session_ends_is_dropped(
 
 
 # ---------------------------------------------------------------------------
-# Import-time behaviour
+# Import-time behavior
 # ---------------------------------------------------------------------------
 
 
@@ -1063,7 +1063,7 @@ async def test_a_denied_write_never_lands_and_the_runner_reports_it_blocked(tmp_
     """The mechanism, end to end, against the real API.
 
     Everything above proves the pieces are shaped right; only this proves the CLI
-    actually honours the veto.
+    actually honors the veto.
 
     Named for what it asserts and no more. The deny carries no `continue_: false`,
     so the model is free to keep going and ask for something else — it would be

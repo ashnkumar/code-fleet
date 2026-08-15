@@ -50,7 +50,7 @@ app = typer.Typer(
     add_completion=False,
 )
 
-# Highlighting off: every colour in this CLI is chosen to mean something, and
+# Highlighting off: every color in this CLI is chosen to mean something, and
 # rich's automatic number/path highlighting competes with that.
 console = Console(highlight=False)
 
@@ -750,7 +750,7 @@ def _task_summary_table(tasks: Sequence[dict[str, Any]]) -> Table:
         table.add_row(
             str(task.get("id", "")),
             str(task.get("title", "")),
-            f"[{_status_colour(status)}]{status}[/]",
+            f"[{_status_color(status)}]{status}[/]",
             f"{task.get('attempts', 0)}/{task.get('max_attempts', 0)}",
             f"${float(task.get('cost_usd') or 0.0):.4f}",
             str(note),
@@ -758,10 +758,10 @@ def _task_summary_table(tasks: Sequence[dict[str, Any]]) -> Table:
     return table
 
 
-def _status_colour(status: str) -> str:
+def _status_color(status: str) -> str:
     """One mapping, shared with the live dashboard.
 
-    A summary table that colours a status differently from the screen the run was
+    A summary table that colors a status differently from the screen the run was
     just watched on reads as a disagreement about what happened. `cyan` covers a
     status this build has not heard of.
     """

@@ -43,7 +43,7 @@ jobs:
         run: uv run pytest -q
 
       # The fleet's target codebase has to be green before a run, or "the tests
-      # still pass afterwards" means nothing.
+      # still pass afterward" means nothing.
       - name: Target repository's own suite
         working-directory: examples/demo-repo
         run: uv run --project "$GITHUB_WORKSPACE" python -m pytest -q

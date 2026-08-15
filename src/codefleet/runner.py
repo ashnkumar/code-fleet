@@ -308,11 +308,11 @@ class Runner:
 
         failure = session.exception()
         if failure is not None:
-            result = self._infra_result(failure)
+            result = self._infra_result(task, failure)
         else:
             outcome = session.result()
             self._log_session_posture(task, outcome)
-            result = self._result_of(outcome)
+            result = self._result_of(task, outcome)
         await self._request(
             "POST", f"/tasks/{task.id}/complete", json=result.model_dump(mode="json")
         )
@@ -499,10 +499,17 @@ class Runner:
                 self.workdir,
             )
 
-    def _result_of(self, outcome: SessionOutcome) -> TaskResult:
+    def _result_of(self, task: Task, outcome: SessionOutcome) -> TaskResult:
+        """`attempt` comes from the assignment, not from a re-read of the row.
+
+        The number this report is about was fixed when the task was handed over.
+        Asking the server for it now would read whatever attempt is current, which
+        is the stale-report bug rather than the fix for it.
+        """
         assert self.agent_id is not None
         return TaskResult(
             agent_id=self.agent_id,
+            attempt=task.attempts,
             ok=outcome.ok,
             summary=outcome.summary,
             error=outcome.error,
@@ -516,7 +523,7 @@ class Runner:
             files_written=outcome.files_written,
         )
 
-    def _infra_result(self, failure: BaseException) -> TaskResult:
+    def _infra_result(self, task: Task, failure: BaseException) -> TaskResult:
         """An executor that blew up is a reportable outcome, not a lost task.
 
         The exception text travels to the server so it lands in `tasks.error`
@@ -525,6 +532,7 @@ class Runner:
         assert self.agent_id is not None
         return TaskResult(
             agent_id=self.agent_id,
+            attempt=task.attempts,
             ok=False,
             error=f"{type(failure).__name__}: {failure}",
             error_kind=ErrorKind.INFRA,
@@ -614,7 +622,7 @@ class ScriptedExecutor:
     """An executor that follows a script instead of running an SDK session.
 
     It speaks the same protocol the real session does — ask before every write,
-    stop dead when denied, report the ledger afterwards — so a fleet driven by it
+    stop dead when denied, report the ledger afterward — so a fleet driven by it
     exercises the entire coordination surface: assignment, dependency cascade,
     lease exclusion, veto, backoff and retry. Nothing here imports the SDK, so
     this is what runs in CI and behind `codefleet demo --dry-run`.

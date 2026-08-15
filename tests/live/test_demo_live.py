@@ -1,10 +1,16 @@
 """The demo, for real: three Claude sessions editing one working tree.
 
 Everything else in this suite proves the coordination is correct against a
-scripted agent. This proves the coordination survives an agent that was not
-told what it would do — that the veto fires on a write nobody scripted, that the
-denied agent stops instead of editing around the block, and that the tree the
-fleet leaves behind still passes the target repository's own tests.
+scripted agent. This proves the coordination survives an agent that was not told
+what it would do — that a real deny reaches the CLI in the exact shape the SDK
+requires, that the veto fires on a write nobody scripted, that the vetoed task
+still finishes on retry, and that the tree the fleet leaves behind still passes
+the target repository's own tests.
+
+What it does not assert is that the denied agent wrote nothing further. Stopping
+is cooperation, not enforcement (spec 4.5 step 6): a test that claimed to prove
+it would have to show the absence of an uncontended write, which is a different
+and much weaker thing than showing the contended one was blocked.
 
 Deselected by default (`-m 'not live'` lives in `pyproject.toml`) because it
 costs money and needs `ANTHROPIC_API_KEY`. Kept cheap: five small tasks on the

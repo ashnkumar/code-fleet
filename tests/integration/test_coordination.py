@@ -19,7 +19,7 @@ Two implementation notes. The server runs on a real port rather than through
 `httpx.ASGITransport`, because that transport buffers a response until the
 handler returns and `/events/stream` never returns — and the stream is one of the
 things under test. And the stale-agent case registers a bare HTTP agent instead
-of a `Runner`: the failure being modelled is a process that died, and a process
+of a `Runner`: the failure being modeled is a process that died, and a process
 that died does not heartbeat, which is exactly what a live `Runner` cannot be
 made to stop doing.
 """
@@ -160,7 +160,7 @@ class RunRecord:
     conflicts: list[dict[str, Any]]
     leases: list[dict[str, Any]]
     tailed: list[dict[str, Any]]  # what one long-lived SSE subscriber saw, live
-    replayed: list[dict[str, Any]]  # the same stream, replayed from since=0 afterwards
+    replayed: list[dict[str, Any]]  # the same stream, replayed from since=0 afterward
 
 
 def select(
@@ -552,7 +552,7 @@ def test_cancelling_a_running_task_fences_its_runner(run: RunRecord) -> None:
 
 
 def test_every_event_type_is_reachable(run: RunRecord) -> None:
-    """Spec 3.8: an enum member nothing emits is vocabulary, not behaviour."""
+    """Spec 3.8: an enum member nothing emits is vocabulary, not behavior."""
     seen = {event["type"] for event in run.events}
     missing = sorted(str(member) for member in EventType if member not in seen)
     assert not missing, f"never emitted in a full run: {', '.join(missing)}"
@@ -580,7 +580,7 @@ async def test_a_silent_agent_loses_its_leases_and_its_task(tmp_path: Path) -> N
     """The recovery path, from the one angle a live `Runner` cannot reach.
 
     The agent that goes quiet here is a bare HTTP client rather than a `Runner`,
-    because the failure being modelled is a process that died: it holds a task
+    because the failure being modeled is a process that died: it holds a task
     and a lease, and then simply stops calling. A `Runner` heartbeats from its own
     asyncio task and would keep doing so.
     """

@@ -90,7 +90,7 @@
   .tl + .tl { margin-top: 9px; }
   .tt { font-family: var(--mono); font-size: 11px; color: #98a0ad; padding-top: 1px; }
   .dot { width: 8px; height: 8px; border-radius: 50%; margin-top: 5px; background: #5b5fc7; }
-  .dot.o { background: #d98324; } .dot.k { background: #3f4552; }
+  .dot.o { background: #d98324; } .dot.k { background: #3f4552; } .dot.r { background: #b03a2c; }
   .te { font-size: 12.2px; line-height: 1.4; }
 
   /* ---- panel 3: veto ---- */
@@ -186,11 +186,13 @@
       <div class="clabel">One run, start to drain</div>
       <div class="tl"><div class="tt">0:00</div><div class="dot"></div>
         <div class="te">T1, T3, T4 assigned — nothing blocks them</div></div>
-      <div class="tl"><div class="tt">0:31</div><div class="dot o"></div>
+      <div class="tl"><div class="tt">0:16</div><div class="dot r"></div>
+        <div class="te">T4 reaches for <span class="m">api.py</span> and is <b>denied</b> — runner-2 holds it</div></div>
+      <div class="tl"><div class="tt">0:17</div><div class="dot o"></div>
         <div class="te">T1 done &rarr; <b>T2 unblocked</b> &rarr; runner-1 picks it up</div></div>
-      <div class="tl"><div class="tt">0:44</div><div class="dot o"></div>
-        <div class="te">T3 done &rarr; <b>T5 unblocked</b> &rarr; runner-2 picks it up</div></div>
-      <div class="tl"><div class="tt">0:52</div><div class="dot k"></div>
+      <div class="tl"><div class="tt">0:24</div><div class="dot o"></div>
+        <div class="te">T3 done &rarr; <b>T5 unblocked</b> &rarr; runner-3 picks it up; runner-2 retries T4</div></div>
+      <div class="tl"><div class="tt">0:50</div><div class="dot k"></div>
         <div class="te">All 5 complete. The fleet drains.</div></div>
     </div>
 

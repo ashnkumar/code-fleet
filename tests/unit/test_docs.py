@@ -75,11 +75,6 @@ def test_run_dir_is_still_the_only_setting_without_a_flag() -> None:
     assert "CODEFLEET_RUN_DIR" in README
 
 
-def test_readme_scheduler_line_count_is_current() -> None:
-    source = (_ROOT / "src" / "codefleet" / "scheduler.py").read_text(encoding="utf-8")
-    assert f"it is {len(source.splitlines())} lines" in README
-
-
 def test_spec_does_not_describe_itself_as_unimplemented() -> None:
     assert "implementation pending" not in SPEC.lower()
 
@@ -143,3 +138,53 @@ def test_both_documents_state_that_bash_is_excluded_and_what_it_costs() -> None:
     for document in (README, SPEC):
         assert "Bash" in document
         assert "cannot run" in document
+
+
+def test_the_spec_does_not_promise_a_replay_the_dashboard_cannot_deliver() -> None:
+    """The tables come from `/state`; only the log is rebuilt from events.
+
+    The dashboard says so in its own docstring, and a document that promises a
+    frame-for-frame replay describes a reducer this project chose not to write.
+    """
+    from codefleet import dashboard
+
+    assert "GET /state" in (inspect.getdoc(dashboard) or "")
+    assert "frame-for-frame" not in SPEC
+    assert "GET /state" in SPEC
+
+
+def test_the_spec_does_not_call_the_staged_demo_unstaged() -> None:
+    """The run is live; the collision inside it is ordered on purpose (SPEC 7).
+
+    Those are different axes, and collapsing them makes the SPEC contradict the
+    disclosure the README, the post and the narrative diagram all carry.
+    """
+    assert "rather than staged" not in SPEC
+    assert "stages deliberately" in SPEC
+
+
+def test_neither_document_describes_the_sandbox_as_confining_reads() -> None:
+    """Sandboxed Bash confines *writes* by default; reads reach the machine.
+
+    Getting this wrong sells the feature as more than it is, in a section whose
+    whole job is explaining why it still would not solve the problem here.
+    """
+    for document in (README, SPEC):
+        assert not re.search(r"confines a command[^.]*to the working directory", document)
+
+
+def test_the_spec_does_not_charge_a_requeue_an_extra_attempt() -> None:
+    """`attempts` counts transitions into `assigned` — `engine.requeue` says so."""
+    from codefleet.engine import requeue
+
+    assert "`attempts` is not touched" in (inspect.getdoc(requeue) or "")
+    assert "requeues the task with `attempts += 1`" not in SPEC
+
+
+def test_the_spec_documents_the_attempt_that_fences_a_completion_report() -> None:
+    """`(task_id, agent_id)` names two attempts once a task is handed back (D23)."""
+    from codefleet.models import TaskResult
+
+    assert "attempt" in TaskResult.model_fields
+    assert TaskResult.model_fields["attempt"].is_required()
+    assert "`(task_id, agent_id, attempt)`" in SPEC

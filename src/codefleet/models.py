@@ -239,9 +239,15 @@ class Event(BaseModel):
 
 
 class TaskResult(BaseModel):
-    """What one runner attempt produced. Also the body of POST /tasks/{id}/complete."""
+    """What one runner attempt produced. Also the body of POST /tasks/{id}/complete.
+
+    `attempt` is the fencing token of the report itself. Without it the server can
+    only ask which attempt is running *now*, which is a different question once a
+    task has been requeued and handed back to the same agent.
+    """
 
     agent_id: str
+    attempt: int
     ok: bool
     summary: str | None = None
     error: str | None = None

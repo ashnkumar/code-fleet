@@ -107,7 +107,13 @@ class Runner:
         return response.json()
 
     async def complete(self, task_id: str, **result: Any) -> dict[str, Any]:
+        """`attempt` defaults to the live one, which is what a real runner reports.
+
+        Pass it explicitly to report an attempt the task has already moved past.
+        """
         body = {"agent_id": self.agent_id, "ok": True} | result
+        if "attempt" not in body:
+            body["attempt"] = (await get_task(self.client, task_id))["attempts"]
         response = await self.client.post(
             f"/tasks/{task_id}/complete", json=body, headers=self.headers
         )
@@ -414,6 +420,85 @@ async def test_a_duplicate_completion_report_changes_nothing(
     assert (await event_types(client)).count("task_succeeded") == 1
 
 
+async def test_a_report_from_a_superseded_attempt_is_never_applied(
+    app: FastAPI, client: AsyncClient
+) -> None:
+    """Spec 5.1: `attempt` is what fences a report, because `(task, agent)` cannot.
+
+    A requeued task can be handed straight back to the agent that just failed it,
+    which puts a second attempt behind the same pair and makes that agent the
+    legitimate owner again. A report from the first attempt — redelivered after a
+    timeout, or arriving late from a runner that was slow to give up — then looks
+    exactly like a report about the attempt now running. Applying it would charge
+    a finished attempt's tokens to a live one, and a stale success would mark the
+    task succeeded while an agent is still working on it.
+    """
+    runner = await register(client, "runner-1")
+    await create_tasks(client, task_spec("T1", max_attempts=3))
+    await runner.await_assignment()
+    assert (await runner.complete("T1", ok=False, error="first try", error_kind="agent_error"))[
+        "attempts"
+    ] == 1
+
+    # Skip the backoff window rather than sleep through it. This runner is the
+    # only free one, so the retry comes back to it.
+    store = app.state.fleet.store
+    async with store.transaction():
+        await store.update_task("T1", backoff_until=None)
+    assert (await runner.await_assignment())["attempts"] == 2
+    app.state.fleet.completions.clear()
+
+    # Attempt 1's report, arriving now. Nothing in flight duplicates it: attempt 2
+    # is running and has reported nothing at all.
+    assert await runner.complete(
+        "T1", attempt=1, ok=True, summary="late", input_tokens=999, cost_usd=5.0
+    ) == {"status": "assigned", "attempts": 2, "duplicate": True}
+
+    task = await get_task(client, "T1")
+    assert task["status"] == "assigned"
+    assert (task["input_tokens"], task["cost_usd"]) == (0, 0.0)
+    assert "task_succeeded" not in await event_types(client)
+
+
+async def test_a_requeued_attempt_reported_twice_survives_the_memo_being_lost(
+    app: FastAPI, client: AsyncClient
+) -> None:
+    """The memo is the convenience; the row is the guarantee.
+
+    A requeue preserves `attempts`, so the attempt number alone cannot tell a
+    redelivery of a requeued report apart from the live one. The cleared owner
+    can, and this is the case that has to hold once the memo is gone — otherwise
+    a restart turns a redelivered failure into a second attempt consumed.
+    """
+    runner = await register(client, "runner-1")
+    await create_tasks(client, task_spec("T1", max_attempts=3))
+    await runner.await_assignment()
+    reported = await runner.complete(
+        "T1", ok=False, error="it broke", error_kind="agent_error", input_tokens=100, cost_usd=0.01
+    )
+    assert reported["status"] == "pending"
+
+    app.state.fleet.completions.clear()
+    response = await client.post(
+        "/tasks/T1/complete",
+        json={
+            "agent_id": runner.agent_id,
+            "attempt": 1,
+            "ok": False,
+            "error": "it broke",
+            "error_kind": "agent_error",
+            "input_tokens": 100,
+            "cost_usd": 0.01,
+        },
+        headers=runner.headers,
+    )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "not_owner"
+
+    task = await get_task(client, "T1")
+    assert (task["attempts"], task["input_tokens"], task["cost_usd"]) == (1, 100, 0.01)
+
+
 async def test_veto_requeues_the_task_and_widens_its_file_scope(client: AsyncClient) -> None:
     runner = await register(client, "runner-1")
     await create_tasks(client, task_spec("T4", file_scope=["linkstash/middleware.py"]))
@@ -669,7 +754,7 @@ async def test_the_fleet_events_do_not_fire_over_work_that_landed_after_the_snap
     assert types.count("run_finished") == 1
 
     # The same window one step later: the idle edge was legitimate and already
-    # emitted, but the finish is decided afterwards and must see the new work.
+    # emitted, but the finish is decided afterward and must see the new work.
     # `_maybe_finish_run` reads the two flags before it awaits anything, so the
     # live loop — which resets them on every pass that sees work — cannot get
     # between setting them here and the decision they drive.
