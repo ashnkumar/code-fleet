@@ -9,8 +9,8 @@ The file lock for parallel Claude coding agents.
 ![Three agents working one repository: T4 is denied a write to api.py because runner-2 holds it for T3, backs off, and succeeds on retry once the file is released.](docs/demo.gif)
 
 A real run: five tasks, three agents, one tree. The red `VETO` is the moment two agents reached for
-the same file — the second one was refused instead of overwriting it, and finished on retry. That is
-a genuine race, so it does not fire on every live run; `--dry-run` makes the timing deterministic,
+the same file — the second one was refused instead of overwriting it, and finished on retry. That's
+a genuine race, so it doesn't fire on every live run; `--dry-run` makes the timing deterministic,
 which is what CI asserts on.
 
 *See the **[technical post](https://example.com/codefleet-technical-post)** for more details.*
@@ -51,12 +51,12 @@ Then two agents reach for the same file. Neither is doing anything wrong — one
 disappears. Both sessions report success, and you find out from the diff.
 
 The usual answer is a worktree per agent, a branch each, and a merge at the end — the right call when
-you want independent branches and a human reviewing PRs. It does not remove the collision, though. It
+you want independent branches and a human reviewing PRs. It doesn't remove the collision, though. It
 moves it to merge time, after both agents have finished and one has spent its whole run against a
 copy that went stale halfway through.
 
 **CodeFleet takes the other trade — one shared working tree, no branches, and the second write is
-refused at the moment it is attempted.** A small coordination server tracks which agent is working in
+refused at the moment it's attempted.** A small coordination server tracks which agent is working in
 which file. Every agent asks it before writing; if someone else is in that file, the write is refused
 and never reaches the disk. The refused agent's task goes back in the queue and runs again once the
 file is free — against real code rather than conflict markers.
@@ -70,9 +70,9 @@ file.
 ![Three panels. One: a five-task graph is declared, with T3 and T4 scoped to different files. Two: three runners execute it in parallel while the server cascades dependencies. Three: T4 reaches for a file another runner holds and the write is vetoed, requeued, and retried.](docs/how-it-works.png)
 
 - **Runners are deliberately thin.** They hold no queue, evaluate no dependencies, and decide nothing
-  about who does what — that is all server-side, in one place, where you can read it. A runner that
+  about who does what — that's all server-side, in one place, where you can read it. A runner that
   stops heartbeating is fenced and its task requeued.
-- **The scheduler returns an ordered list, and the order is the contract.** The server applies six
+- **The scheduler returns an ordered list, and the order is the contract.** The server applies 6
   kinds of decision top to bottom in one transaction. Placing new work is only correct against the
   state the earlier steps leave behind: a lease held by a runner that just went offline has to be
   released first, or assignment reads that path as busy. Apply the list out of order and you
@@ -103,18 +103,18 @@ server for a lease on the path. If another agent holds it, the hook returns
 file, and its task is requeued with the contended path folded into its file scope — so the scheduler
 runs it after the holder releases.
 
-Only half of that is enforced. A denied tool call does not execute, and that part is the CLI rather
+Only half of that is enforced. A denied tool call doesn't execute, and that part is the CLI rather
 than the model's cooperation. What the agent does *next* is its own business: the deny carries no
 stop signal, so a session can keep going and reach for a different file — and gets the same answer on
-anything else that is held. The guarantee is per write, not per session.
+anything else that's held. The guarantee is per write, not per session.
 
-The session runs `permission_mode="dontAsk"` with `allowed_tools` naming seven tools. Nothing
-prompts, and anything that is *not* on the list — a tool from the target repo's own `.mcp.json`, a
+The session runs `permission_mode="dontAsk"` with `allowed_tools` naming 7 tools. Nothing
+prompts, and anything that's *not* on the list — a tool from the target repo's own `.mcp.json`, a
 plugin, a settings file — is refused rather than run. Two more obvious APIs were rejected first:
 
 | Rejected | Why |
 |---|---|
-| `can_use_tool` | The permission callback the host controls, which looks exactly right. It requires streaming-input mode, and it is *shadowed* by `permission_mode="bypassPermissions"` and by every whole-tool entry in `allowed_tools`. The SDK emits a `CanUseToolShadowedWarning` that points you at `PreToolUse` itself. |
+| `can_use_tool` | The permission callback the host controls, which looks exactly right. It requires streaming-input mode, and it's *shadowed* by `permission_mode="bypassPermissions"` and by every whole-tool entry in `allowed_tools`. The SDK emits a `CanUseToolShadowedWarning` that points you at `PreToolUse` itself. |
 | `permission_mode="acceptEdits"` | It auto-accepts file edits, which is the part we want — but every *other* tool stays on the standard permission path, which prompts, and an unattended runner has nobody to answer a prompt. |
 
 The two modes that do stop the prompting were rejected on principle. `bypassPermissions` approves
@@ -132,10 +132,10 @@ veto.
 The demo graph stages exactly this, on purpose. T3 (`api.py`) and T4 (`middleware.py`) declare
 disjoint scopes, so the scheduler runs them together — correctly, by its own rules. But T4's prompt
 tells the agent to register its middleware in `api.py` *before* writing the file its scope actually
-names. That is the shape of the mistake someone makes writing a file list before reading the code,
-and in a demo you have to schedule it: staged, the veto fires in four of five recorded live runs;
-left merely likely, it fired in three of six. The agent is free to reorder, which is the whole reason
-a declared scope cannot be the lock.
+names. That's the shape of the mistake someone makes writing a file list before reading the code,
+and in a demo you have to schedule it: staged, the veto fires in 4 of 5 recorded live runs;
+left merely likely, it fired in 3 of 6. The agent is free to reorder, which is the whole reason
+a declared scope can't be the lock.
 
 `SPEC.md` has the rest: the data model, every coordination rule, the full HTTP API, and the
 alternatives that were considered and dropped.
@@ -176,7 +176,7 @@ the store nor the scheduler.
 ## Limitations
 
 - **One shared working tree, and no git automation** — no worktrees, no branches, no commits, no
-  PRs. Agents edit your checkout in place, and what you are left with is an uncommitted diff to read
+  PRs. Agents edit your checkout in place, and what you're left with is an uncommitted diff to read
   and commit yourself.
 - **Agents cannot run commands.** The session gets exactly
   `Read`/`Write`/`Edit`/`MultiEdit`/`NotebookEdit`/`Glob`/`Grep`. `Bash` is excluded because a shell
@@ -184,14 +184,14 @@ the store nor the scheduler.
   Code's sandboxed `Bash` bounds the write blast radius, but a sandbox policy is fixed when the session
   starts and a lease is not, so it cannot say *this file, right now, belongs to another runner*. The
   price is that a task cannot run the tests it just wrote, or a linter, or `git`.
-- **A green run is not a verified run.** A task succeeds when its session ends cleanly, which means
+- **A green run isn't a verified run.** A task succeeds when its session ends cleanly, which means
   the model stopped — not that what it wrote compiles. Pass `codefleet run --verify "pytest -q"` and
   let the exit code decide; `codefleet demo` does this with the target repository's own suite. That
   runs over a tree the agents just wrote, so it executes agent-authored code — point the fleet at a
   checkout you would be willing to `git checkout -- .`.
 
 `SPEC.md` has the full list: §7 covers what a failed attempt leaves behind and the one window where
-revocation cannot recall a write already authorized; §8 covers what is deliberately out of scope —
+revocation can't recall a write already authorized; §8 covers what is deliberately out of scope —
 including authentication, which the server has none of. It binds `127.0.0.1` and should stay there.
 
 ## License
