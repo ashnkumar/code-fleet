@@ -13,7 +13,7 @@ the same file — the second one was refused instead of overwriting it, and fini
 a genuine race, so it doesn't fire on every live run; `--dry-run` makes the timing deterministic,
 which is what CI asserts on.
 
-*See the **[technical post](https://example.com/codefleet-technical-post)** for more details.*
+*See the **[technical post](https://voxellabs.ai/projects/codefleet)** for more details.*
 
 ## Quickstart
 
